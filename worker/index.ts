@@ -1,0 +1,436 @@
+import { Buffer } from "node:buffer";
+import { desc, eq, inArray, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/d1";
+import type { AnalysisResponse, Comparable, DetectedItem, Stats } from "../src/types";
+import { analyzeFrame } from "./agent";
+import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db/schema";
+import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
+
+const MAX_FRAME_BYTES = 2_500_000;
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    try {
+      if (request.method === "GET" && url.pathname === "/api/health") {
+        return Response.json({ ok: true, model: env.OPENAI_MODEL });
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/stats") {
+        return Response.json(await getStats(env));
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/items") {
+        return Response.json(await getItems(env));
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/api/items/")) {
+        const itemId = decodeURIComponent(url.pathname.slice("/api/items/".length));
+        if (!itemId || itemId.includes("/")) throw new HttpError(400, "Invalid item id.");
+        return Response.json(await getFrameItems(env, itemId));
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/sessions") {
+        return await createSession(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/analyze") {
+        return await analyzeRequest(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/api/thumbnails/")) {
+        return await serveThumbnail(url, env);
+      }
+
+      return Response.json({ error: "Not found" }, { status: 404 });
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : 500;
+      const message = error instanceof Error ? error.message : "Unexpected error";
+      console.error(JSON.stringify({ message: "request failed", path: url.pathname, status, error: message }));
+      return Response.json({ error: message }, { status });
+    }
+  },
+} satisfies ExportedHandler<Env>;
+
+async function createSession(request: Request, env: Env): Promise<Response> {
+  const body = await request.json<unknown>();
+  if (!isRecord(body) || typeof body.id !== "string") {
+    throw new HttpError(400, "A session id is required.");
+  }
+
+  const sourceType = body.sourceType === "video" || body.sourceType === "image" ? body.sourceType : "camera";
+  const sourceName = typeof body.sourceName === "string" ? body.sourceName.slice(0, 240) : null;
+  const startedAt = new Date().toISOString();
+  const db = drizzle(env.DB);
+
+  await db
+    .insert(scanSessions)
+    .values({ id: body.id, sourceType, sourceName, startedAt })
+    .onConflictDoNothing();
+
+  return Response.json({ id: body.id, sourceType, sourceName, startedAt }, { status: 201 });
+}
+
+async function analyzeRequest(request: Request, env: Env): Promise<Response> {
+  if (!env.OPENAI_API_KEY || env.OPENAI_API_KEY === "your_openai_api_key_here") {
+    throw new HttpError(503, "Add your OpenAI API key to .dev.vars before scanning.");
+  }
+
+  const started = Date.now();
+  const form = await request.formData();
+  const image = form.get("image");
+  const sessionId = form.get("sessionId");
+  const capturedAtValue = form.get("capturedAt");
+
+  if (!(image instanceof File) || !image.type.startsWith("image/")) {
+    throw new HttpError(400, "A JPEG or WebP frame is required.");
+  }
+  if (image.size > MAX_FRAME_BYTES) {
+    throw new HttpError(413, "Frame exceeds the 2.5 MB limit.");
+  }
+  if (typeof sessionId !== "string" || !sessionId) {
+    throw new HttpError(400, "A session id is required.");
+  }
+
+  const capturedAt =
+    typeof capturedAtValue === "string" && !Number.isNaN(Date.parse(capturedAtValue))
+      ? new Date(capturedAtValue).toISOString()
+      : new Date().toISOString();
+  const frameId = crypto.randomUUID();
+  const extension = image.type === "image/webp" ? "webp" : "jpg";
+  const thumbnailKey = `frames/${sessionId}/${frameId}.${extension}`;
+  const bytes = await image.arrayBuffer();
+  const imageDataUrl = `data:${image.type};base64,${Buffer.from(bytes).toString("base64")}`;
+  const db = drizzle(env.DB);
+
+  await db
+    .insert(scanSessions)
+    .values({ id: sessionId, sourceType: "camera", sourceName: null, startedAt: capturedAt })
+    .onConflictDoNothing();
+  await env.THUMBNAILS.put(thumbnailKey, bytes, {
+    httpMetadata: { contentType: image.type, cacheControl: "private, max-age=31536000, immutable" },
+  });
+
+  try {
+    const result = await analyzeFrame({
+      apiKey: env.OPENAI_API_KEY,
+      model: env.OPENAI_MODEL,
+      imageDataUrl,
+      db,
+      sessionId,
+    });
+    const detectedItems: DetectedItem[] = [];
+    const knownFingerprints = await db
+      .select({ id: items.id, fingerprint: items.fingerprint })
+      .from(items)
+      .orderBy(desc(items.lastSeenAt))
+      .limit(250);
+
+    for (const candidate of result.analysis.items) {
+      const proposedFingerprint = normalizeFingerprint(candidate.fingerprint || candidate.name);
+      if (!proposedFingerprint) continue;
+
+      const semanticMatch = knownFingerprints
+        .map((known) => ({ ...known, score: fingerprintSimilarity(proposedFingerprint, known.fingerprint) }))
+        .filter((known) => known.score >= 0.72)
+        .sort((left, right) => right.score - left.score)[0];
+      const fingerprint = semanticMatch?.fingerprint ?? proposedFingerprint;
+
+      const proposedId = crypto.randomUUID();
+      const [saved] = await db
+        .insert(items)
+        .values({
+          id: proposedId,
+          scanSessionId: sessionId,
+          fingerprint,
+          name: candidate.name,
+          category: candidate.category,
+          brand: candidate.brand,
+          model: candidate.model,
+          description: candidate.description,
+          condition: candidate.condition,
+          confidence: candidate.confidence,
+          observedPriceCents: candidate.observedPriceCents,
+          currency: candidate.currency,
+          estimatedLowCents: candidate.estimatedLowCents,
+          estimatedHighCents: candidate.estimatedHighCents,
+          retailPriceCents: candidate.retailPriceCents,
+          activePriceCents: candidate.activePriceCents,
+          soldPriceCents: candidate.soldPriceCents,
+          valueSummary: candidate.valueSummary,
+          thumbnailKey,
+          boxXMin: candidate.boundingBox.xMin,
+          boxYMin: candidate.boundingBox.yMin,
+          boxXMax: candidate.boundingBox.xMax,
+          boxYMax: candidate.boundingBox.yMax,
+          rawJson: JSON.stringify(candidate),
+          firstSeenAt: capturedAt,
+          lastSeenAt: capturedAt,
+          seenCount: 1,
+        })
+        .onConflictDoUpdate({
+          target: items.fingerprint,
+          set: {
+            name: candidate.name,
+            category: candidate.category,
+            brand: candidate.brand,
+            model: candidate.model,
+            description: candidate.description,
+            condition: candidate.condition,
+            confidence: candidate.confidence,
+            observedPriceCents: candidate.observedPriceCents,
+            currency: candidate.currency,
+            estimatedLowCents: candidate.estimatedLowCents,
+            estimatedHighCents: candidate.estimatedHighCents,
+            retailPriceCents: candidate.retailPriceCents,
+            activePriceCents: candidate.activePriceCents,
+            soldPriceCents: candidate.soldPriceCents,
+            valueSummary: candidate.valueSummary,
+            thumbnailKey,
+            boxXMin: candidate.boundingBox.xMin,
+            boxYMin: candidate.boundingBox.yMin,
+            boxXMax: candidate.boundingBox.xMax,
+            boxYMax: candidate.boundingBox.yMax,
+            rawJson: JSON.stringify(candidate),
+            lastSeenAt: capturedAt,
+            seenCount: sql`${items.seenCount} + 1`,
+          },
+        })
+        .returning();
+      if (!saved) throw new Error("D1 did not return the saved item.");
+      const id = saved.id;
+      const firstSeenAt = saved.firstSeenAt;
+      const seenCount = saved.seenCount;
+      const duplicate = proposedId !== id;
+      if (!duplicate) knownFingerprints.push({ id, fingerprint });
+
+      const comparableRows = candidate.comparables.map((comparable) => ({
+        id: crypto.randomUUID(),
+        itemId: id,
+        sourceType: comparable.type,
+        title: comparable.title,
+        url: comparable.url,
+        priceCents: comparable.priceCents,
+        currency: comparable.currency,
+        capturedAt,
+      }));
+      if (comparableRows.length > 0) {
+        await db.insert(valuationSources).values(comparableRows);
+      }
+
+      detectedItems.push({
+        id,
+        scanSessionId: sessionId,
+        fingerprint,
+        name: candidate.name,
+        category: candidate.category,
+        brand: candidate.brand,
+        model: candidate.model,
+        description: candidate.description,
+        condition: candidate.condition,
+        confidence: candidate.confidence,
+        observedPriceCents: candidate.observedPriceCents,
+        currency: candidate.currency,
+        estimatedLowCents: candidate.estimatedLowCents,
+        estimatedHighCents: candidate.estimatedHighCents,
+        retailPriceCents: candidate.retailPriceCents,
+        activePriceCents: candidate.activePriceCents,
+        soldPriceCents: candidate.soldPriceCents,
+        valueSummary: candidate.valueSummary,
+        thumbnailUrl: `/api/thumbnails/${thumbnailKey}`,
+        boundingBox: candidate.boundingBox,
+        firstSeenAt,
+        lastSeenAt: capturedAt,
+        seenCount,
+        duplicate,
+        comparables: candidate.comparables,
+      });
+    }
+
+    if (detectedItems.length === 0) {
+      await env.THUMBNAILS.delete(thumbnailKey);
+    }
+
+    const latencyMs = Date.now() - started;
+    await db.insert(frameRuns).values({
+      id: frameId,
+      scanSessionId: sessionId,
+      capturedAt,
+      latencyMs,
+      itemCount: detectedItems.length,
+      modelCalls: result.modelCalls,
+      searchesPerformed: result.searchesPerformed,
+      status: "completed",
+      error: null,
+    });
+    await incrementStats(env, {
+      frames: 1,
+      items: detectedItems.length,
+      searches: result.searchesPerformed,
+      modelCalls: result.modelCalls,
+    });
+
+    const response: AnalysisResponse = {
+      frameId,
+      items: detectedItems,
+      stats: await getStats(env),
+      run: { latencyMs, modelCalls: result.modelCalls, searchesPerformed: result.searchesPerformed },
+    };
+    return Response.json(response);
+  } catch (error) {
+    const latencyMs = Date.now() - started;
+    const message = error instanceof Error ? error.message : "Frame analysis failed";
+    await Promise.all([
+      db.insert(frameRuns).values({
+        id: frameId,
+        scanSessionId: sessionId,
+        capturedAt,
+        latencyMs,
+        itemCount: 0,
+        modelCalls: 0,
+        searchesPerformed: 0,
+        status: "failed",
+        error: message.slice(0, 1000),
+      }),
+      incrementStats(env, { frames: 1, items: 0, searches: 0, modelCalls: 0 }),
+      env.THUMBNAILS.delete(thumbnailKey),
+    ]);
+    throw error;
+  }
+}
+
+async function getItems(env: Env): Promise<DetectedItem[]> {
+  const db = drizzle(env.DB);
+  const rows = await db.select().from(items).orderBy(desc(items.lastSeenAt)).limit(100);
+  return hydrateItems(env, rows);
+}
+
+async function getFrameItems(env: Env, itemId: string): Promise<DetectedItem[]> {
+  const db = drizzle(env.DB);
+  const selected = await db.select().from(items).where(eq(items.id, itemId)).limit(1).then((rows) => rows[0]);
+  if (!selected) throw new HttpError(404, "Find not found.");
+  const rows = await db
+    .select()
+    .from(items)
+    .where(eq(items.thumbnailKey, selected.thumbnailKey))
+    .orderBy(desc(items.lastSeenAt));
+  return hydrateItems(env, rows);
+}
+
+async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): Promise<DetectedItem[]> {
+  const db = drizzle(env.DB);
+  const ids = rows.map((row) => row.id);
+  const sources =
+    ids.length === 0
+      ? []
+      : await db
+          .select()
+          .from(valuationSources)
+          .where(inArray(valuationSources.itemId, ids))
+          .orderBy(desc(valuationSources.capturedAt));
+  const sourceMap = new Map<string, Comparable[]>();
+  for (const source of sources) {
+    const comparables = sourceMap.get(source.itemId) ?? [];
+    if (comparables.length < 8) {
+      comparables.push({
+        title: source.title,
+        url: source.url,
+        priceCents: source.priceCents,
+        currency: source.currency,
+        type: source.sourceType,
+      });
+      sourceMap.set(source.itemId, comparables);
+    }
+  }
+
+  return rows.map((row) => ({
+    id: row.id,
+    scanSessionId: row.scanSessionId,
+    fingerprint: row.fingerprint,
+    name: row.name,
+    category: row.category,
+    brand: row.brand,
+    model: row.model,
+    description: row.description,
+    condition: row.condition,
+    confidence: row.confidence,
+    observedPriceCents: row.observedPriceCents,
+    currency: row.currency,
+    estimatedLowCents: row.estimatedLowCents,
+    estimatedHighCents: row.estimatedHighCents,
+    retailPriceCents: row.retailPriceCents,
+    activePriceCents: row.activePriceCents,
+    soldPriceCents: row.soldPriceCents,
+    valueSummary: row.valueSummary,
+    thumbnailUrl: `/api/thumbnails/${row.thumbnailKey}`,
+    boundingBox:
+      row.boxXMin === null || row.boxYMin === null || row.boxXMax === null || row.boxYMax === null
+        ? null
+        : { xMin: row.boxXMin, yMin: row.boxYMin, xMax: row.boxXMax, yMax: row.boxYMax },
+    firstSeenAt: row.firstSeenAt,
+    lastSeenAt: row.lastSeenAt,
+    seenCount: row.seenCount,
+    duplicate: row.seenCount > 1,
+    comparables: sourceMap.get(row.id) ?? [],
+  }));
+}
+
+async function serveThumbnail(url: URL, env: Env): Promise<Response> {
+  const key = decodeURIComponent(url.pathname.slice("/api/thumbnails/".length));
+  if (!key.startsWith("frames/") || key.includes("..")) {
+    throw new HttpError(400, "Invalid thumbnail key.");
+  }
+  const object = await env.THUMBNAILS.get(key);
+  if (!object) throw new HttpError(404, "Thumbnail not found.");
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("etag", object.httpEtag);
+  headers.set("cache-control", "private, max-age=31536000, immutable");
+  return new Response(object.body, { headers });
+}
+
+async function incrementStats(
+  env: Env,
+  delta: { frames: number; items: number; searches: number; modelCalls: number },
+): Promise<void> {
+  const updatedAt = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO app_stats (id, frames_processed, items_identified, searches_performed, model_calls, last_updated)
+     VALUES (1, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       frames_processed = frames_processed + excluded.frames_processed,
+       items_identified = items_identified + excluded.items_identified,
+       searches_performed = searches_performed + excluded.searches_performed,
+       model_calls = model_calls + excluded.model_calls,
+       last_updated = excluded.last_updated`,
+  )
+    .bind(delta.frames, delta.items, delta.searches, delta.modelCalls, updatedAt)
+    .run();
+}
+
+async function getStats(env: Env): Promise<Stats> {
+  const db = drizzle(env.DB);
+  const row = await db.select().from(appStats).where(eq(appStats.id, 1)).limit(1).then((rows) => rows[0]);
+  return {
+    framesProcessed: row?.framesProcessed ?? 0,
+    itemsIdentified: row?.itemsIdentified ?? 0,
+    searchesPerformed: row?.searchesPerformed ?? 0,
+    modelCalls: row?.modelCalls ?? 0,
+    lastUpdated: row?.lastUpdated ?? null,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
