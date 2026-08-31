@@ -50,7 +50,43 @@ const frameAnalysisSchema = z.object({
 
 export type FrameAnalysis = z.infer<typeof frameAnalysisSchema>;
 
+export type AgentRunAudit = {
+  instructions: string;
+  input: unknown;
+  events: Array<{ sequence: number; type: string; title: string; data: unknown }>;
+  rawResponses: unknown[];
+  output: unknown;
+  usage: unknown;
+};
+
 type AgentDb = DrizzleD1Database<Record<string, never>>;
+
+export const AGENT_INPUT_TEXT = "Analyze this frame. Return and value only clearly identifiable items that are likely being offered for sale.";
+
+export const AGENT_INSTRUCTIONS = `You inspect a single frame from a thrift-store or garage-sale scan.
+
+Your goal is a high-precision shortlist of likely merchandise, not an exhaustive inventory of everything visible. When uncertain, omit the object rather than guess.
+
+Only return an object when both are true:
+- The scene provides evidence that it is merchandise being offered for sale, such as placement with other sale items, display on a sale table or rack, or a visible price tag.
+- It is visible clearly enough to identify at a useful, searchable level with confidence of at least 0.70. A useful identity may be a specific product or a meaningful category such as “vintage ceramic table lamp,” but not “unknown object,” “clothing,” or another vague label.
+
+Never return:
+- People, body parts, or clothing, shoes, jewelry, accessories, bags, or other possessions currently worn or carried by a person.
+- Objects merely held or actively used by a person, unless the person is unmistakably presenting that object as merchandise for sale.
+- Tables, shelving, bins, racks, signs, vehicles, buildings, or other scene fixtures unless that exact object is clearly tagged or displayed for sale.
+- Background decor, partial objects at the frame edge, heavily occluded items, or small and blurry objects whose identity would require guessing.
+- Separate components or details of an item when they belong to one larger sellable object.
+
+Apply these inclusion rules before calling tools or searching the web. Do not invent details hidden by the frame. Read price tags when possible. For each included item:
+1. Return one tight bounding box around the entire item. Use normalized integer coordinates from 0 to 1000, with (0, 0) at the frame's top-left and (1000, 1000) at its bottom-right. Ensure xMin < xMax and yMin < yMax.
+2. Produce a stable lowercase semantic fingerprint using brand, model, and generic item identity. Exclude price, condition, color, and session-specific details.
+3. Call check_previous_scans for the fingerprint before finalizing.
+4. Use web search when the identity is specific enough to find useful market evidence. Seek all three when possible: current retail, active listings, and recent sold comparables. Never imply an active asking price is a completed sale.
+5. Return integer prices in cents. Use null when evidence is insufficient. Include concise source titles and URLs in comparables.
+6. Estimate a conservative resale range that reflects the visible condition and uncertainty.
+
+Return an empty items array when no object passes every inclusion rule. Currency defaults to USD unless a visible tag or source clearly indicates otherwise.`;
 
 export async function analyzeFrame(options: {
   apiKey: string;
@@ -58,7 +94,7 @@ export async function analyzeFrame(options: {
   imageDataUrl: string;
   db: AgentDb;
   sessionId: string;
-}): Promise<{ analysis: FrameAnalysis; modelCalls: number; searchesPerformed: number }> {
+}): Promise<{ analysis: FrameAnalysis; modelCalls: number; searchesPerformed: number; audit: AgentRunAudit }> {
   const checkPreviousScans = tool({
     name: "check_previous_scans",
     description:
@@ -92,17 +128,7 @@ export async function analyzeFrame(options: {
   const agent = new Agent({
     name: "Yard Sale Gold Scout",
     model: options.model,
-    instructions: `You inspect a single frame from a thrift-store or garage-sale scan.
-
-Identify every distinct sellable object that is meaningfully visible. Do not invent details hidden by the frame. Read price tags when possible. For each item:
-1. Return one tight bounding box around the entire item. Use normalized integer coordinates from 0 to 1000, with (0, 0) at the frame's top-left and (1000, 1000) at its bottom-right. Ensure xMin < xMax and yMin < yMax.
-2. Produce a stable lowercase semantic fingerprint using brand, model, and generic item identity. Exclude price, condition, color, and session-specific details.
-3. Call check_previous_scans for the fingerprint before finalizing.
-4. Use web search when the identity is specific enough to find useful market evidence. Seek all three when possible: current retail, active listings, and recent sold comparables. Never imply an active asking price is a completed sale.
-5. Return integer prices in cents. Use null when evidence is insufficient. Include concise source titles and URLs in comparables.
-6. Estimate a conservative resale range that reflects the visible condition and uncertainty.
-
-Return an empty items array if no sellable object can be identified. Currency defaults to USD unless a visible tag or source clearly indicates otherwise.`,
+    instructions: AGENT_INSTRUCTIONS,
     tools: [
       checkPreviousScans,
       webSearchTool({ searchContextSize: "low", externalWebAccess: true }),
@@ -120,7 +146,7 @@ Return an empty items array if no sellable object can be identified. Currency de
         content: [
           {
             type: "input_text",
-            text: "Analyze this frame. Find and value every distinct sellable item you can identify.",
+            text: AGENT_INPUT_TEXT,
           },
           { type: "input_image", image: options.imageDataUrl, detail: "high" },
         ],
@@ -143,5 +169,54 @@ Return an empty items array if no sellable object can be identified. Currency de
     analysis: result.finalOutput,
     modelCalls: result.runContext.usage.requests,
     searchesPerformed,
+    audit: {
+      instructions: AGENT_INSTRUCTIONS,
+      input: {
+        role: "user",
+        content: [
+          { type: "input_text", text: AGENT_INPUT_TEXT },
+          { type: "input_image", image: "[frame stored in R2]", detail: "high" },
+        ],
+      },
+      events: result.newItems.map((item, sequence) => {
+        const data = safeAuditValue(item.toJSON());
+        return { sequence, type: item.type, title: runItemTitle(item.type, data), data };
+      }),
+      rawResponses: result.rawResponses.map(safeAuditValue),
+      output: safeAuditValue(result.finalOutput),
+      usage: safeAuditValue(result.runContext.usage),
+    },
   };
+}
+
+function safeAuditValue(value: unknown): unknown {
+  const seen = new WeakSet<object>();
+  const serialized = JSON.stringify(value, (key, nestedValue: unknown) => {
+    if (/api[_-]?key|authorization/i.test(key)) return "[redacted]";
+    if (key === "encrypted_content" || key === "rawContent") return undefined;
+    if (typeof nestedValue === "string" && nestedValue.startsWith("data:image/")) {
+      return "[frame stored in R2]";
+    }
+    if (typeof nestedValue === "object" && nestedValue !== null) {
+      if (seen.has(nestedValue)) return "[circular]";
+      seen.add(nestedValue);
+    }
+    return nestedValue;
+  });
+  return serialized === undefined ? null : JSON.parse(serialized);
+}
+
+function runItemTitle(type: string, data: unknown): string {
+  const rawItem = isRecord(data) && isRecord(data.rawItem) ? data.rawItem : null;
+  const toolName = rawItem && typeof rawItem.name === "string" ? rawItem.name : null;
+  if (toolName?.startsWith("web_search")) return "Web search";
+  if (type === "tool_call_item") return toolName ? `Tool call · ${toolName}` : "Tool call";
+  if (type === "tool_call_output_item") return "Tool result";
+  if (type === "reasoning_item") return "Reasoning summary";
+  if (type === "message_output_item") return "Assistant response";
+  return type.replaceAll("_", " ");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

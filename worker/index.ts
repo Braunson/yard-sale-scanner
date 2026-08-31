@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { AnalysisResponse, Comparable, DetectedItem, Stats } from "../src/types";
-import { analyzeFrame } from "./agent";
+import type { AgentRunEvent, AgentRunHistory, AnalysisResponse, Comparable, DetectedItem, Stats } from "../src/types";
+import { AGENT_INPUT_TEXT, AGENT_INSTRUCTIONS, analyzeFrame } from "./agent";
 import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db/schema";
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
 
@@ -32,6 +32,12 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/items") {
         return Response.json(await getItems(env));
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/api/agent-runs/by-item/")) {
+        const itemId = decodeURIComponent(url.pathname.slice("/api/agent-runs/by-item/".length));
+        if (!itemId || itemId.includes("/")) throw new HttpError(400, "Invalid item id.");
+        return Response.json(await getAgentRunForItem(env, itemId));
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/api/items/")) {
@@ -262,14 +268,38 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
     }
 
     const latencyMs = Date.now() - started;
+    const completedAt = new Date().toISOString();
+    if (detectedItems.length === 0) {
+      console.info(
+        JSON.stringify({
+          message: "frame analysis returned no items",
+          frameId,
+          sessionId,
+          capturedAt,
+          latencyMs,
+          model: env.OPENAI_MODEL,
+          modelCalls: result.modelCalls,
+          searchesPerformed: result.searchesPerformed,
+        }),
+      );
+    }
     await db.insert(frameRuns).values({
       id: frameId,
       scanSessionId: sessionId,
+      thumbnailKey,
       capturedAt,
+      completedAt,
       latencyMs,
       itemCount: detectedItems.length,
       modelCalls: result.modelCalls,
       searchesPerformed: result.searchesPerformed,
+      model: env.OPENAI_MODEL,
+      instructions: result.audit.instructions,
+      inputJson: JSON.stringify(result.audit.input),
+      eventsJson: JSON.stringify(result.audit.events),
+      rawResponsesJson: JSON.stringify(result.audit.rawResponses),
+      outputJson: JSON.stringify(result.audit.output),
+      usageJson: JSON.stringify(result.audit.usage),
       status: "completed",
       error: null,
     });
@@ -289,16 +319,32 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
     return Response.json(response);
   } catch (error) {
     const latencyMs = Date.now() - started;
+    const completedAt = new Date().toISOString();
     const message = error instanceof Error ? error.message : "Frame analysis failed";
     await Promise.all([
       db.insert(frameRuns).values({
         id: frameId,
         scanSessionId: sessionId,
+        thumbnailKey,
         capturedAt,
+        completedAt,
         latencyMs,
         itemCount: 0,
         modelCalls: 0,
         searchesPerformed: 0,
+        model: env.OPENAI_MODEL,
+        instructions: AGENT_INSTRUCTIONS,
+        inputJson: JSON.stringify({
+          role: "user",
+          content: [
+            { type: "input_text", text: AGENT_INPUT_TEXT },
+            { type: "input_image", image: "[frame stored in R2]", detail: "high" },
+          ],
+        }),
+        eventsJson: "[]",
+        rawResponsesJson: "[]",
+        outputJson: "null",
+        usageJson: "null",
         status: "failed",
         error: message.slice(0, 1000),
       }),
@@ -325,6 +371,49 @@ async function getFrameItems(env: Env, itemId: string): Promise<DetectedItem[]> 
     .where(eq(items.thumbnailKey, selected.thumbnailKey))
     .orderBy(desc(items.lastSeenAt));
   return hydrateItems(env, rows);
+}
+
+async function getAgentRunForItem(env: Env, itemId: string): Promise<AgentRunHistory> {
+  const db = drizzle(env.DB);
+  const selected = await db
+    .select({ thumbnailKey: items.thumbnailKey })
+    .from(items)
+    .where(eq(items.id, itemId))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (!selected) throw new HttpError(404, "Find not found.");
+
+  const run = await db
+    .select()
+    .from(frameRuns)
+    .where(eq(frameRuns.thumbnailKey, selected.thumbnailKey))
+    .orderBy(desc(frameRuns.capturedAt))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (!run || !run.instructions) {
+    throw new HttpError(404, "Agent activity was not recorded for this older find.");
+  }
+
+  return {
+    frameId: run.id,
+    scanSessionId: run.scanSessionId,
+    thumbnailUrl: `/api/thumbnails/${selected.thumbnailKey}`,
+    capturedAt: run.capturedAt,
+    completedAt: run.completedAt,
+    latencyMs: run.latencyMs,
+    itemCount: run.itemCount,
+    modelCalls: run.modelCalls,
+    searchesPerformed: run.searchesPerformed,
+    model: run.model ?? "Unknown model",
+    status: run.status,
+    error: run.error,
+    instructions: run.instructions,
+    input: parseJson(run.inputJson, null),
+    events: parseJson<AgentRunEvent[]>(run.eventsJson, []),
+    rawResponses: parseJson<unknown[]>(run.rawResponsesJson, []),
+    output: parseJson(run.outputJson, null),
+    usage: parseJson(run.usageJson, null),
+  };
 }
 
 async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): Promise<DetectedItem[]> {
@@ -433,4 +522,13 @@ async function getStats(env: Env): Promise<Stats> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseJson<T>(value: string | null, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
 }

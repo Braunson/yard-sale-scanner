@@ -72,15 +72,27 @@ export const frameRuns = sqliteTable(
     scanSessionId: text("scan_session_id")
       .notNull()
       .references(() => scanSessions.id, { onDelete: "cascade" }),
+    thumbnailKey: text("thumbnail_key"),
     capturedAt: text("captured_at").notNull(),
+    completedAt: text("completed_at"),
     latencyMs: integer("latency_ms").notNull(),
     itemCount: integer("item_count").notNull(),
     modelCalls: integer("model_calls").notNull(),
     searchesPerformed: integer("searches_performed").notNull(),
+    model: text("model"),
+    instructions: text("instructions"),
+    inputJson: text("input_json"),
+    eventsJson: text("events_json"),
+    rawResponsesJson: text("raw_responses_json"),
+    outputJson: text("output_json"),
+    usageJson: text("usage_json"),
     status: text("status", { enum: ["completed", "failed"] }).notNull(),
     error: text("error"),
   },
-  (table) => [index("frame_runs_session_idx").on(table.scanSessionId)],
+  (table) => [
+    index("frame_runs_session_idx").on(table.scanSessionId),
+    index("frame_runs_thumbnail_idx").on(table.thumbnailKey),
+  ],
 );
 
 export const appStats = sqliteTable("app_stats", {

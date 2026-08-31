@@ -59,3 +59,31 @@ export type AnalysisResponse = {
     searchesPerformed: number;
   };
 };
+
+export type AgentRunEvent = {
+  sequence: number;
+  type: string;
+  title: string;
+  data: unknown;
+};
+
+export type AgentRunHistory = {
+  frameId: string;
+  scanSessionId: string;
+  thumbnailUrl: string;
+  capturedAt: string;
+  completedAt: string | null;
+  latencyMs: number;
+  itemCount: number;
+  modelCalls: number;
+  searchesPerformed: number;
+  model: string;
+  status: "completed" | "failed";
+  error: string | null;
+  instructions: string;
+  input: unknown;
+  events: AgentRunEvent[];
+  rawResponses: unknown[];
+  output: unknown;
+  usage: unknown;
+};

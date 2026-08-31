@@ -40,7 +40,16 @@ const findRoute = createRoute({
   component: () => null,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, scanRoute, historyRoute, findRoute]);
+const findActivityRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/finds/$itemId/activity",
+  validateSearch: (search: Record<string, unknown>) => ({
+    from: search.from === "scan" ? ("scan" as const) : ("history" as const),
+  }),
+  component: () => null,
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, scanRoute, historyRoute, findRoute, findActivityRoute]);
 
 export const router = createRouter({ routeTree });
 

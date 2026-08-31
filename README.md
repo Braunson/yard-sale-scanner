@@ -35,13 +35,14 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
 
 4. Open `http://127.0.0.1:5173`. Select a camera for live scanning or snapshots, or upload a photo/video. Garage-sale clips are available in the local `yard-sale-footage/` folder.
 
-The browser samples a compressed frame every 1.8 seconds and allows up to five analyses in flight. Frame images are not bundled with the app.
+The browser samples compressed frames at a configurable 1–20 second interval and allows up to five analyses in flight. Frame images are not bundled with the app.
 
 ## Routes and state
 
 - `/scan` — camera, snapshots, uploads, and the live findings feed
 - `/history` — saved inventory
 - `/finds/:itemId?from=scan|history` — shareable item detail modal with its originating view preserved
+- `/finds/:itemId/activity?from=scan|history` — the persisted agent activity for the item's latest frame
 
 TanStack Query owns remote stats and inventory data. Camera streams, capture timers, in-flight frame work, and the current live feed remain local React state because they are ephemeral browser state.
 
@@ -65,6 +66,7 @@ Each frame starts one bounded agent run. The agent:
 4. Returns structured retail, active-listing, sold-comparable, and resale-range data.
 5. Returns normalized item coordinates and draws bounding boxes over saved frames.
 6. Persists new or repeated detections atomically. Exact fingerprints are unique, with conservative token-overlap matching to absorb wording changes such as “metal-and-glass console table” versus “glass-top console table.”
+7. Stores a sanitized per-frame audit record containing prompts, ordered run items, tool calls and results, raw model responses, final structured output, and usage. API keys, raw base64 images, encrypted reasoning, and hidden reasoning content are excluded.
 
 The UI reports cumulative frames processed, items identified, searches performed, and underlying model calls. See [FEATURES.md](./FEATURES.md) for live-feed tracking, natural-language filters, eBay integration, and batch processing.
 
