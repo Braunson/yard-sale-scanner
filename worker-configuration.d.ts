@@ -6,6 +6,8 @@ interface __BaseEnv_Env {
 	DB: D1Database;
 	OPENAI_MODEL: "gpt-5.6-luna";
 	OPENAI_API_KEY: string;
+	EBAY_CLIENT_ID: string;
+	EBAY_CLIENT_SECRET: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
@@ -18,7 +20,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "OPENAI_MODEL" | "OPENAI_API_KEY">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "OPENAI_MODEL" | "OPENAI_API_KEY" | "EBAY_CLIENT_ID" | "EBAY_CLIENT_SECRET">> {}
 }
 
 // Begin runtime types

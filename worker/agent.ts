@@ -3,6 +3,7 @@ import { desc, inArray } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
 import { items } from "./db/schema";
+import { createEbayTools, type EbayCredentials } from "./ebay";
 import { normalizeFingerprint } from "./normalize";
 
 const comparableSchema = z.object({
@@ -82,8 +83,8 @@ Apply these inclusion rules before calling tools or searching the web. Do not in
 1. Return one tight bounding box around the entire item. Use normalized integer coordinates from 0 to 1000, with (0, 0) at the frame's top-left and (1000, 1000) at its bottom-right. Ensure xMin < xMax and yMin < yMax.
 2. Produce a stable lowercase semantic fingerprint using brand, model, and generic item identity. Exclude price, condition, color, and session-specific details.
 3. Call check_previous_scans for the fingerprint before finalizing.
-4. Use web search when the identity is specific enough to find useful market evidence. Seek all three when possible: current retail, active listings, and recent sold comparables. Never imply an active asking price is a completed sale.
-5. Return integer prices in cents. Use null when evidence is insufficient. Include concise source titles and URLs in comparables.
+4. Use search_ebay_active_listings for eBay active-listing comparables whenever the identity is specific enough to search. Use web search for current retail prices and any recent sold evidence. An active eBay asking price is never a completed sale.
+5. Return integer prices in cents. Use null when evidence is insufficient. Include concise source titles and URLs in comparables. eBay comparables must be type "active".
 6. Estimate a conservative resale range that reflects the visible condition and uncertainty.
 
 Return an empty items array when no object passes every inclusion rule. Currency defaults to USD unless a visible tag or source clearly indicates otherwise.`;
@@ -94,6 +95,7 @@ export async function analyzeFrame(options: {
   imageDataUrl: string;
   db: AgentDb;
   sessionId: string;
+  ebayCredentials?: EbayCredentials;
 }): Promise<{ analysis: FrameAnalysis; modelCalls: number; searchesPerformed: number; audit: AgentRunAudit }> {
   const checkPreviousScans = tool({
     name: "check_previous_scans",
@@ -132,6 +134,7 @@ export async function analyzeFrame(options: {
     tools: [
       checkPreviousScans,
       webSearchTool({ searchContextSize: "low", externalWebAccess: true }),
+      ...createEbayTools(options.ebayCredentials),
     ],
     outputType: frameAnalysisSchema,
   });
@@ -161,8 +164,8 @@ export async function analyzeFrame(options: {
   const searchesPerformed = result.newItems.filter(
     (item) =>
       item.type === "tool_call_item" &&
-      item.rawItem.type === "hosted_tool_call" &&
-      item.rawItem.name.startsWith("web_search"),
+      ((item.rawItem.type === "function_call" && item.rawItem.name === "search_ebay_active_listings") ||
+        (item.rawItem.type === "hosted_tool_call" && item.rawItem.name.startsWith("web_search"))),
   ).length;
 
   return {

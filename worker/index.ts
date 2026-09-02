@@ -34,6 +34,16 @@ export default {
         return Response.json(await getItems(env));
       }
 
+      if (request.method === "DELETE" && url.pathname === "/api/items") {
+        return Response.json(await deleteAllItems(env));
+      }
+
+      if (request.method === "DELETE" && url.pathname.startsWith("/api/items/")) {
+        const itemId = decodeURIComponent(url.pathname.slice("/api/items/".length));
+        if (!itemId || itemId.includes("/")) throw new HttpError(400, "Invalid item id.");
+        return Response.json(await deleteItem(env, itemId));
+      }
+
       if (request.method === "GET" && url.pathname.startsWith("/api/agent-runs/by-item/")) {
         const itemId = decodeURIComponent(url.pathname.slice("/api/agent-runs/by-item/".length));
         if (!itemId || itemId.includes("/")) throw new HttpError(400, "Invalid item id.");
@@ -134,6 +144,10 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
       imageDataUrl,
       db,
       sessionId,
+      ebayCredentials:
+        env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
+          ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
+          : undefined,
     });
     const detectedItems: DetectedItem[] = [];
     const knownFingerprints = await db
@@ -359,6 +373,50 @@ async function getItems(env: Env): Promise<DetectedItem[]> {
   const db = drizzle(env.DB);
   const rows = await db.select().from(items).orderBy(desc(items.lastSeenAt)).limit(100);
   return hydrateItems(env, rows);
+}
+
+async function deleteItem(env: Env, itemId: string): Promise<{ deletedId: string }> {
+  const db = drizzle(env.DB);
+  const storedItem = await db
+    .select({ id: items.id, thumbnailKey: items.thumbnailKey })
+    .from(items)
+    .where(eq(items.id, itemId))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (!storedItem) throw new HttpError(404, "Find not found.");
+
+  await db.delete(items).where(eq(items.id, itemId));
+  const thumbnailStillUsed = await db
+    .select({ id: items.id })
+    .from(items)
+    .where(eq(items.thumbnailKey, storedItem.thumbnailKey))
+    .limit(1)
+    .then((rows) => rows.length > 0);
+  if (!thumbnailStillUsed) await deleteThumbnailKeys(env, [storedItem.thumbnailKey]);
+
+  return { deletedId: itemId };
+}
+
+async function deleteAllItems(env: Env): Promise<{ deleted: number }> {
+  const db = drizzle(env.DB);
+  const storedItems = await db.select({ id: items.id, thumbnailKey: items.thumbnailKey }).from(items);
+  await db.delete(items);
+  await deleteThumbnailKeys(env, [...new Set(storedItems.map((item) => item.thumbnailKey))]);
+  return { deleted: storedItems.length };
+}
+
+async function deleteThumbnailKeys(env: Env, keys: string[]): Promise<void> {
+  try {
+    for (let index = 0; index < keys.length; index += 1_000) {
+      await env.THUMBNAILS.delete(keys.slice(index, index + 1_000));
+    }
+  } catch (error) {
+    console.error(JSON.stringify({
+      message: "thumbnail cleanup failed after deleting finds",
+      keys: keys.length,
+      error: error instanceof Error ? error.message : "Unknown R2 error",
+    }));
+  }
 }
 
 async function getFrameItems(env: Env, itemId: string): Promise<DetectedItem[]> {

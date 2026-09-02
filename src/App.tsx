@@ -13,7 +13,9 @@ import {
   LoaderCircle,
   ScanLine,
   Search,
+  Settings,
   Square,
+  Trash2,
   Video,
   X,
 } from "lucide-react";
@@ -57,6 +59,16 @@ async function fetchAgentRun(itemId: string): Promise<AgentRunHistory> {
   return body as AgentRunHistory;
 }
 
+async function deleteFindRequest(itemId: string): Promise<void> {
+  const response = await fetch(`/api/items/${encodeURIComponent(itemId)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error("Could not delete this find.");
+}
+
+async function deleteAllFindsRequest(): Promise<void> {
+  const response = await fetch("/api/items", { method: "DELETE" });
+  if (!response.ok) throw new Error("Could not delete all finds.");
+}
+
 export default function App({ children }: { children?: React.ReactNode }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -85,6 +97,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const [stillPreviewUrl, setStillPreviewUrl] = useState<string | null>(null);
   const [snapshotFlash, setSnapshotFlash] = useState(0);
   const [scanIntervalSeconds, setScanIntervalSeconds] = useState(2);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const location = useRouterState({ select: (state) => state.location });
@@ -442,45 +456,76 @@ export default function App({ children }: { children?: React.ReactNode }) {
 
   const displayedItems = view === "scan" ? liveItems : historyItems;
 
+  useEffect(() => {
+    if (view !== "history") return;
+    stopMedia();
+    setSelectedCameraId("off");
+    setSessionId(null);
+    setStillPreviewUrl(null);
+  }, [view]);
+
+  const openItem = (selected: DetectedItem, sourceView: View) => {
+    const sourceItems = sourceView === "scan" ? liveItems : historyItems;
+    setSelectedItem(selected);
+    setSelectedFrameItems(sourceItems.filter((candidate) => candidate.thumbnailUrl === selected.thumbnailUrl));
+    void navigate({
+      to: "/finds/$itemId",
+      params: { itemId: selected.id },
+      search: { from: sourceView },
+    });
+  };
+
+  const deleteFind = async (item: DetectedItem) => {
+    if (!window.confirm(`Delete “${item.name}”? This cannot be undone.`)) return;
+    setDeletingItemId(item.id);
+    try {
+      await deleteFindRequest(item.id);
+      setLiveItems((current) => current.filter((candidate) => candidate.id !== item.id));
+      queryClient.setQueryData<DetectedItem[]>(["items"], (current = []) =>
+        current.filter((candidate) => candidate.id !== item.id),
+      );
+      setError(null);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Could not delete this find.");
+    } finally {
+      setDeletingItemId(null);
+    }
+  };
+
+  const deleteAllFinds = async () => {
+    if (!window.confirm(`Delete all ${historyItems.length} saved finds? This cannot be undone.`)) return;
+    setDeletingItemId("all");
+    try {
+      await deleteAllFindsRequest();
+      setLiveItems([]);
+      queryClient.setQueryData<DetectedItem[]>(["items"], []);
+      setSettingsOpen(false);
+      setError(null);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Could not delete all finds.");
+    } finally {
+      setDeletingItemId(null);
+    }
+  };
+
   return (
-    <div className="app-shell">
-      <main>
-        <section className="stats-ribbon" aria-label="Live processing statistics">
-          <Stat label="Frames" value={stats.framesProcessed} />
-          <Stat label="Items" value={stats.itemsIdentified} />
-          <Stat label="Searches" value={stats.searchesPerformed} />
-          <Stat label="Model calls" value={stats.modelCalls} />
-        </section>
+    <div className={`app-shell ${view === "scan" ? "scan-shell" : "history-shell"}`}>
+      {view === "scan" ? (
+        <main className="immersive-scan">
+          <section className="camera-stage">
+            <video ref={videoRef} playsInline onEnded={stopScan} />
+            {stillPreviewUrl && <img className="still-preview" src={stillPreviewUrl} alt="Uploaded frame" />}
+            {!sessionId && (
+              <div className="camera-empty">
+                <div className="reticle"><ScanLine size={44} /></div>
+              </div>
+            )}
+            <div className="camera-shade" aria-hidden="true" />
+            {snapshotFlash > 0 && <span key={snapshotFlash} className="snapshot-flash" aria-hidden="true" />}
 
-        {view === "scan" ? (
-          <>
-            <section className="camera-stage">
-              <video ref={videoRef} playsInline onEnded={stopScan} />
-              {stillPreviewUrl && <img className="still-preview" src={stillPreviewUrl} alt="Uploaded frame" />}
-              {snapshotFlash > 0 && <span key={snapshotFlash} className="snapshot-flash" aria-hidden="true" />}
-              {!sessionId && (
-                <div className="camera-empty">
-                  <div className="reticle"><ScanLine size={54} /></div>
-                </div>
-              )}
-              {sessionId && (
-                <div className="camera-hud">
-                  <span className="hud-source">
-                    {source === "camera" ? <Camera size={14} /> : source === "image" ? <ImageUp size={14} /> : <Video size={14} />}
-                    {sourceLabel}
-                  </span>
-                  <span className="hud-throughput">
-                    {inFlight > 0 ? <LoaderCircle className="spin" size={14} /> : <Gauge size={14} />}
-                    {inFlight} / {MAX_CONCURRENT_FRAMES} active
-                  </span>
-                </div>
-              )}
-              <canvas ref={canvasRef} hidden />
-            </section>
-
-            <section className="scan-actions">
+            <header className="scan-topbar">
               <label className="camera-select-control">
-                <Camera size={18} />
+                <Camera size={14} />
                 <select
                   value={selectedCameraId}
                   onChange={(event) => void selectCamera(event.target.value)}
@@ -494,99 +539,202 @@ export default function App({ children }: { children?: React.ReactNode }) {
                   ))}
                 </select>
               </label>
-              <button className={`primary-action ${scanning ? "stop" : ""}`} onClick={() => void toggleLiveScan()}>
-                {scanning ? <Square size={15} fill="currentColor" /> : <ScanLine size={18} />}
-                {scanning ? "Stop live" : "Start live"}
-              </button>
-              <button className="secondary-action" onClick={() => void takeSnapshot()}>
-                <Camera size={18} /> Snapshot
-              </button>
-              <label className="upload-action" title="Upload a photo or video" aria-label="Upload a photo or video">
-                <ImageUp size={19} />
-                <input
-                  type="file"
-                  accept="image/jpeg,image/png,image/webp,image/*,video/mp4,video/quicktime,video/*"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    if (file?.type.startsWith("image/")) void loadImage(file);
-                    else if (file) void loadVideo(file);
-                    event.currentTarget.value = "";
-                  }}
-                />
-              </label>
-              <div className="scan-frequency">
-                <span>1s</span>
-                <input
-                  type="range"
-                  min="1"
-                  max="20"
-                  step="1"
-                  value={scanIntervalSeconds}
-                  onChange={(event) => changeScanInterval(Number(event.target.value))}
-                  aria-label={`Scan every ${scanIntervalSeconds} seconds`}
-                />
-                <span>20s</span>
-                <strong>Every {scanIntervalSeconds}s</strong>
+              <div className={`live-state ${scanning ? "is-live" : ""}`} aria-live="polite">
+                <span />
+                {scanning ? "Live" : "Paused"}
               </div>
+              <button className="settings-trigger" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+                <Settings size={15} />
+              </button>
+            </header>
+
+            <section className="stats-ribbon" aria-label="Live processing statistics">
+              <div className="stat active-stat" title={`${inFlight} of ${MAX_CONCURRENT_FRAMES} requests active`}>
+                {inFlight > 0 ? <LoaderCircle className="spin" size={12} /> : <Gauge size={12} />}
+                <strong>{inFlight}/{MAX_CONCURRENT_FRAMES}</strong>
+                <span>Active</span>
+              </div>
+              <Stat label="Frames" value={stats.framesProcessed} />
+              <Stat label="Items" value={stats.itemsIdentified} />
+              <Stat label="Searches" value={stats.searchesPerformed} />
+              <Stat label="Calls" value={stats.modelCalls} />
             </section>
-          </>
-        ) : (
-          <section className="history-heading">
-            <div>
-              <p className="eyebrow">All-time finds</p>
-              <h2>Saved inventory</h2>
-            </div>
-            <button className="icon-button" onClick={() => void refreshHistory()} aria-label="Refresh history">
-              <History size={20} />
-            </button>
-          </section>
-        )}
 
-        {error && (
-          <div className="error-banner">
-            <span>{error}</span>
-            <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={16} /></button>
-          </div>
-        )}
+            {sessionId && <div className="source-caption">
+              {source === "camera" ? <Camera size={13} /> : source === "image" ? <ImageUp size={13} /> : <Video size={13} />}
+              <span>{sourceLabel}</span>
+            </div>}
 
-        <section className="finds-section">
-          <div className="item-feed">
-            {displayedItems.map((item) => (
-              <ItemCard
-                key={`${item.id}-${view === "scan" ? streamItemTokens[item.id] ?? "stable" : "history"}`}
-                item={item}
-                animate={view === "scan"}
-                onSelect={(selected) => {
-                  setSelectedItem(selected);
-                  setSelectedFrameItems(
-                    displayedItems.filter((candidate) => candidate.thumbnailUrl === selected.thumbnailUrl),
-                  );
-                  void navigate({
-                    to: "/finds/$itemId",
-                    params: { itemId: selected.id },
-                    search: { from: view },
-                  });
-                }}
-              />
-            ))}
-            {displayedItems.length === 0 && (
-              <div className="empty-feed">
-                <CircleDollarSign size={36} />
-                {view === "history" && <p>No saved finds yet.</p>}
+            <section className="live-find-stack" aria-label="Latest finds">
+              {liveItems.map((item) => (
+                <ItemCard
+                  key={`${item.id}-${streamItemTokens[item.id] ?? "stable"}`}
+                  item={item}
+                  animate
+                  overlay
+                  onSelect={(selected) => openItem(selected, "scan")}
+                />
+              ))}
+            </section>
+
+            {error && (
+              <div className="error-banner">
+                <span>{error}</span>
+                <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={16} /></button>
               </div>
             )}
-          </div>
-        </section>
-      </main>
+            <canvas ref={canvasRef} hidden />
+          </section>
+        </main>
+      ) : (
+        <main className="history-screen">
+          <header className="history-heading">
+            <div>
+              <p className="eyebrow">All-time finds</p>
+              <h1>History</h1>
+            </div>
+            <div className="history-actions">
+              <button className="icon-button" onClick={() => void refreshHistory()} aria-label="Refresh history">
+                <History size={20} />
+              </button>
+              <button className="icon-button" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+                <Settings size={19} />
+              </button>
+            </div>
+          </header>
+          <section className="stats-ribbon history-stats" aria-label="Processing statistics">
+            <Stat label="Frames" value={stats.framesProcessed} />
+            <Stat label="Items" value={stats.itemsIdentified} />
+            <Stat label="Searches" value={stats.searchesPerformed} />
+            <Stat label="Calls" value={stats.modelCalls} />
+          </section>
+          {error && (
+            <div className="error-banner history-error">
+              <span>{error}</span>
+              <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={16} /></button>
+            </div>
+          )}
+          <section className="finds-section">
+            <div className="item-feed">
+              {displayedItems.map((item) => (
+                <ItemCard key={`${item.id}-history`} item={item} onSelect={(selected) => openItem(selected, "history")} />
+              ))}
+              {displayedItems.length === 0 && (
+                <div className="empty-feed">
+                  <CircleDollarSign size={36} />
+                  <p>No saved finds yet.</p>
+                </div>
+              )}
+            </div>
+          </section>
+        </main>
+      )}
 
-      <nav className="bottom-nav" aria-label="Primary navigation">
+      <nav className={`bottom-nav ${view === "scan" ? "scan-nav" : ""}`} aria-label="Primary navigation">
         <Link to="/scan" className={view === "scan" ? "active" : ""}>
           <ScanLine /> <span>Scan</span>
         </Link>
+        {view === "scan" && <>
+          <button
+            className={`dock-action ${scanning ? "is-active" : ""}`}
+            onClick={() => void toggleLiveScan()}
+            aria-label={scanning ? "Stop live scanning" : "Start live scanning"}
+          >
+            {scanning ? <Square size={18} fill="currentColor" /> : <ScanLine size={20} />}
+            <span>{scanning ? "Stop" : "Live"}</span>
+          </button>
+          <button className="dock-action snapshot-action" onClick={() => void takeSnapshot()} aria-label="Take snapshot">
+            <Camera size={22} />
+            <span>Snap</span>
+          </button>
+          <label className="dock-action dock-upload" aria-label="Upload a photo or video">
+            <ImageUp size={20} />
+            <span>Upload</span>
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/*,video/mp4,video/quicktime,video/*"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file?.type.startsWith("image/")) void loadImage(file);
+                else if (file) void loadVideo(file);
+                event.currentTarget.value = "";
+              }}
+            />
+          </label>
+          <details className="dock-frequency">
+            <summary className="dock-action" aria-label={`Scan every ${scanIntervalSeconds} seconds`}>
+              <Gauge size={20} />
+              <span>{scanIntervalSeconds}s</span>
+            </summary>
+            <div className="frequency-popover">
+              <strong>Every {scanIntervalSeconds}s</strong>
+              <input
+                type="range"
+                min="1"
+                max="20"
+                step="1"
+                value={scanIntervalSeconds}
+                onChange={(event) => changeScanInterval(Number(event.target.value))}
+                aria-label={`Scan every ${scanIntervalSeconds} seconds`}
+              />
+              <span><b>1s</b><b>20s</b></span>
+            </div>
+          </details>
+        </>}
         <Link to="/history" className={view === "history" ? "active" : ""} onClick={() => void refreshHistory()}>
           <Archive /> <span>History</span>
         </Link>
       </nav>
+
+      {settingsOpen && (
+        <div className="settings-backdrop" onMouseDown={() => setSettingsOpen(false)}>
+          <section
+            className="settings-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="settings-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <header>
+              <div>
+                <p className="eyebrow">Saved inventory</p>
+                <h2 id="settings-title">Settings</h2>
+              </div>
+              <button onClick={() => setSettingsOpen(false)} aria-label="Close settings"><X size={18} /></button>
+            </header>
+            <div className="settings-find-list">
+              {historyItems.map((item) => (
+                <div className="settings-find" key={item.id}>
+                  <img src={item.thumbnailUrl} alt="" />
+                  <div>
+                    <strong>{item.name}</strong>
+                    <span>{formatRange(item)}</span>
+                  </div>
+                  <button
+                    onClick={() => void deleteFind(item)}
+                    disabled={deletingItemId !== null}
+                    aria-label={`Delete ${item.name}`}
+                  >
+                    {deletingItemId === item.id ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}
+                  </button>
+                </div>
+              ))}
+              {historyItems.length === 0 && <p className="settings-empty">No saved finds.</p>}
+            </div>
+            <footer>
+              <button
+                className="delete-all-button"
+                onClick={() => void deleteAllFinds()}
+                disabled={historyItems.length === 0 || deletingItemId !== null}
+              >
+                {deletingItemId === "all" ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}
+                Delete all finds
+              </button>
+              <span>Processing stats are kept.</span>
+            </footer>
+          </section>
+        </div>
+      )}
 
       {selectedItem && (
         <ItemDetail
@@ -640,15 +788,17 @@ function Stat({ label, value }: { label: string; value: number }) {
 function ItemCard({
   item,
   animate,
+  overlay,
   onSelect,
 }: {
   item: DetectedItem;
   animate?: boolean;
+  overlay?: boolean;
   onSelect: (item: DetectedItem) => void;
 }) {
   return (
     <button
-      className={`item-card${animate ? " stream-in" : ""}`}
+      className={`item-card${animate ? " stream-in" : ""}${overlay ? " overlay-card" : ""}`}
       onClick={() => onSelect(item)}
     >
       <div className="thumbnail-wrap">
@@ -743,15 +893,16 @@ function ItemDetail({
     <div className="modal-backdrop" onMouseDown={onClose}>
       <article className="detail-sheet" onMouseDown={(event) => event.stopPropagation()}>
         <button className="close-button" onClick={onClose} aria-label="Close"><X /></button>
-        <div className="detail-visual">
-          <AnnotatedImage
-            key={item.thumbnailUrl}
-            items={frameItems}
-            activeItemId={highlightedItemId}
-            onHoverItem={setHoveredItemId}
-          />
-        </div>
-        <div className="detail-content">
+        <div className="detail-scroll">
+          <div className="detail-visual">
+            <AnnotatedImage
+              key={item.thumbnailUrl}
+              items={frameItems}
+              activeItemId={highlightedItemId}
+              onHoverItem={setHoveredItemId}
+            />
+          </div>
+          <div className="detail-content">
           <p className="eyebrow">{frameItems.length} item{frameItems.length === 1 ? "" : "s"} found in this frame</p>
           <div ref={frameListRef} className="frame-find-list">
             {frameItems.map((frameItem) => (
@@ -823,6 +974,7 @@ function ItemDetail({
               </dl>
             </>
           )}
+          </div>
         </div>
       </article>
     </div>
@@ -1035,6 +1187,7 @@ function money(cents: number, currency: string): string {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: currency || "USD",
+    currencyDisplay: "narrowSymbol",
     maximumFractionDigits: cents % 100 === 0 ? 0 : 2,
   }).format(cents / 100);
 }
