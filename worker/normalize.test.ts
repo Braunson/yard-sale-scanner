@@ -26,4 +26,19 @@ describe("normalizeFingerprint", () => {
     expect(fingerprintSimilarity("large round wall mirror", "pink oval wall mirror")).toBe(0);
     expect(fingerprintSimilarity("rolled beige area rug", "gray black abstract area rug")).toBe(0);
   });
+
+  it("retrieves likely duplicates from their names and descriptions despite different fingerprints", () => {
+    const jonJosef = [
+      "jon josef pointed toe flats",
+      "Jon Josef pointed-toe flats",
+      "Mint-green pointed-toe slip-on flats with visible Jon Josef branding and Made in Spain marking",
+    ].join(" ");
+    const mintPumps = [
+      "mint green pointed toe pumps",
+      "Mint green pointed-toe pumps",
+      "Pair of mint green pointed-toe pumps with sculpted high heels and spring shoe trees",
+    ].join(" ");
+
+    expect(fingerprintSimilarity(jonJosef, mintPumps)).toBeGreaterThan(0);
+  });
 });

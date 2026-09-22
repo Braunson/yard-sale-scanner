@@ -50,7 +50,7 @@ export function createEbayTools(credentials: EbayCredentials | undefined) {
   const searchEbayActiveListings = tool({
     name: "search_ebay_active_listings",
     description:
-      'Search live eBay fixed-price listings for pricing comparables. Returns current asking prices with condition and shipping. These are active listings, never completed sales; report them as type "active".',
+      'Secondary market-research tool that may run in parallel with retailer-focused web search once the product identity is specific enough. Searches live eBay fixed-price listings and returns asking prices with condition and shipping. These are active listings, never completed sales or the primary retail-price baseline; report them as type "active".',
     parameters: z.object({
       query: z.string().min(2).max(300).describe("Search query with brand, item type, and key attributes."),
       limit: z.number().int().min(1).max(20).default(8),

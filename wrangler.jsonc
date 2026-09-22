@@ -3,6 +3,12 @@
   "name": "yard-sale-gold",
   "main": "./worker/index.ts",
   "compatibility_date": "2026-08-24",
+  "routes": [
+    {
+      "pattern": "yardsale.wesbos.com",
+      "custom_domain": true
+    }
+  ],
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"]
@@ -10,14 +16,16 @@
   "d1_databases": [
     {
       "binding": "DB",
+      "remote": true,
       "database_name": "yard-sale-gold-db",
-      "database_id": "00000000-0000-0000-0000-000000000001",
+      "database_id": "ef692960-193c-4fb8-82ba-5ce9f1832988",
       "migrations_dir": "./migrations"
     }
   ],
   "r2_buckets": [
     {
       "binding": "THUMBNAILS",
+      "remote": true,
       "bucket_name": "yard-sale-gold-thumbnails"
     }
   ],

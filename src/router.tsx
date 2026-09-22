@@ -51,7 +51,7 @@ const findActivityRoute = createRoute({
 
 const routeTree = rootRoute.addChildren([indexRoute, scanRoute, historyRoute, findRoute, findActivityRoute]);
 
-export const router = createRouter({ routeTree });
+export const router = createRouter({ routeTree, scrollRestoration: true });
 
 declare module "@tanstack/react-router" {
   interface Register {

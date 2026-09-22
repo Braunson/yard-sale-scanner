@@ -49,6 +49,11 @@ export type DetectedItem = {
   comparables: Comparable[];
 };
 
+export type HistoryPage = {
+  items: DetectedItem[];
+  nextCursor: string | null;
+};
+
 export type AnalysisResponse = {
   frameId: string;
   items: DetectedItem[];

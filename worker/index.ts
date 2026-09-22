@@ -1,8 +1,9 @@
 import { Buffer } from "node:buffer";
 import { desc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { AgentRunEvent, AgentRunHistory, AnalysisResponse, Comparable, DetectedItem, Stats } from "../src/types";
-import { AGENT_INPUT_TEXT, AGENT_INSTRUCTIONS, analyzeFrame } from "./agent";
+import type { AgentRunEvent, AgentRunHistory, AnalysisResponse, Comparable, DetectedItem, HistoryPage, Stats } from "../src/types";
+import { HISTORY_PAGE_SIZE, HistoryQueryError, historyQuery } from "./history";
+import { AGENT_INSTRUCTIONS, analyzeFrame, buildAgentInputText } from "./agent";
 import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db/schema";
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
 
@@ -31,7 +32,7 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/api/items") {
-        return Response.json(await getItems(env));
+        return Response.json(await getItems(env, url.searchParams));
       }
 
       if (request.method === "DELETE" && url.pathname === "/api/items") {
@@ -70,7 +71,7 @@ export default {
 
       return Response.json({ error: "Not found" }, { status: 404 });
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
+      const status = error instanceof HttpError ? error.status : error instanceof HistoryQueryError ? 400 : 500;
       const message = error instanceof Error ? error.message : "Unexpected error";
       console.error(JSON.stringify({ message: "request failed", path: url.pathname, status, error: message }));
       return Response.json({ error: message }, { status });
@@ -107,6 +108,7 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
   const image = form.get("image");
   const sessionId = form.get("sessionId");
   const capturedAtValue = form.get("capturedAt");
+  const findCriteriaValue = form.get("findCriteria");
 
   if (!(image instanceof File) || !image.type.startsWith("image/")) {
     throw new HttpError(400, "A JPEG or WebP frame is required.");
@@ -117,6 +119,10 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
   if (typeof sessionId !== "string" || !sessionId) {
     throw new HttpError(400, "A session id is required.");
   }
+  if (findCriteriaValue !== null && typeof findCriteriaValue !== "string") {
+    throw new HttpError(400, "Find criteria must be text.");
+  }
+  const findCriteria = (findCriteriaValue ?? "").slice(0, 1000);
 
   const capturedAt =
     typeof capturedAtValue === "string" && !Number.isNaN(Date.parse(capturedAtValue))
@@ -144,6 +150,7 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
       imageDataUrl,
       db,
       sessionId,
+      findCriteria,
       ebayCredentials:
         env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
           ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
@@ -160,11 +167,15 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
       const proposedFingerprint = normalizeFingerprint(candidate.fingerprint || candidate.name);
       if (!proposedFingerprint) continue;
 
-      const semanticMatch = knownFingerprints
+      const lunaMatch = candidate.previousMatchId
+        ? knownFingerprints.find((known) => known.id === candidate.previousMatchId)
+        : undefined;
+      const fingerprintFallback = knownFingerprints
         .map((known) => ({ ...known, score: fingerprintSimilarity(proposedFingerprint, known.fingerprint) }))
         .filter((known) => known.score >= 0.72)
         .sort((left, right) => right.score - left.score)[0];
-      const fingerprint = semanticMatch?.fingerprint ?? proposedFingerprint;
+      const previousMatch = lunaMatch ?? fingerprintFallback;
+      const fingerprint = previousMatch?.fingerprint ?? proposedFingerprint;
 
       const proposedId = crypto.randomUUID();
       const [saved] = await db
@@ -351,7 +362,7 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
         inputJson: JSON.stringify({
           role: "user",
           content: [
-            { type: "input_text", text: AGENT_INPUT_TEXT },
+            { type: "input_text", text: buildAgentInputText(findCriteria) },
             { type: "input_image", image: "[frame stored in R2]", detail: "high" },
           ],
         }),
@@ -369,10 +380,17 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function getItems(env: Env): Promise<DetectedItem[]> {
+async function getItems(env: Env, params: URLSearchParams): Promise<HistoryPage> {
   const db = drizzle(env.DB);
-  const rows = await db.select().from(items).orderBy(desc(items.lastSeenAt)).limit(100);
-  return hydrateItems(env, rows);
+  const rows = await historyQuery(db, params);
+  const page = rows.slice(0, HISTORY_PAGE_SIZE);
+  const last = page.at(-1);
+  return {
+    items: await hydrateItems(env, page),
+    nextCursor: rows.length > HISTORY_PAGE_SIZE && last
+      ? JSON.stringify({ lastSeenAt: last.lastSeenAt, id: last.id })
+      : null,
+  };
 }
 
 async function deleteItem(env: Env, itemId: string): Promise<{ deletedId: string }> {

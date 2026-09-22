@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
   Archive,
@@ -6,6 +6,7 @@ import {
   Camera,
   ChevronRight,
   CircleDollarSign,
+  Download,
   ExternalLink,
   Gauge,
   History,
@@ -19,8 +20,8 @@ import {
   Video,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { AgentRunHistory, AnalysisResponse, DetectedItem, Stats } from "./types";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { AgentRunHistory, AnalysisResponse, DetectedItem, HistoryPage, Stats } from "./types";
 
 const EMPTY_STATS: Stats = {
   framesProcessed: 0,
@@ -29,7 +30,17 @@ const EMPTY_STATS: Stats = {
   modelCalls: 0,
   lastUpdated: null,
 };
-const MAX_CONCURRENT_FRAMES = 5;
+const DEFAULT_MAX_CONCURRENT_FRAMES = 5;
+const MAX_CONCURRENT_FRAMES_SETTING = 100;
+const FIND_CRITERIA_STORAGE_KEY = "yard-sale-find-criteria";
+const FIND_CRITERIA_PRESETS = [
+  { label: "Vintage tees", value: "Vintage band tees worth more than $40" },
+  { label: "Modern electronics", value: "Electronics that are still modern enough to use" },
+  { label: "Designer goods", value: "Authentic designer clothing, shoes, bags, and accessories with strong resale value" },
+  { label: "Collectibles", value: "Vintage toys, trading cards, figurines, and collectibles worth more than $30" },
+  { label: "Quality cookware", value: "High-quality cookware, cast iron, knives, and small kitchen appliances worth reselling" },
+  { label: "Rare media", value: "Rare, collectible, or out-of-print books, records, CDs, and physical media" },
+];
 
 type View = "scan" | "history";
 type Source = "camera" | "video" | "image";
@@ -40,10 +51,22 @@ async function fetchStats(): Promise<Stats> {
   return response.json();
 }
 
-async function fetchItems(): Promise<DetectedItem[]> {
-  const response = await fetch("/api/items");
+async function fetchItems(search: string, cursor: string | null, signal: AbortSignal): Promise<HistoryPage> {
+  const params = new URLSearchParams({ q: search });
+  if (cursor) params.set("cursor", cursor);
+  const response = await fetch(`/api/items?${params}`, { signal });
   if (!response.ok) throw new Error("Could not load saved finds.");
   return response.json();
+}
+
+function useHistory(search: string, enabled: boolean) {
+  return useInfiniteQuery({
+    queryKey: ["items", search],
+    queryFn: ({ pageParam, signal }) => fetchItems(search, pageParam, signal),
+    initialPageParam: null as string | null,
+    getNextPageParam: (page) => page.nextCursor,
+    enabled,
+  });
 }
 
 async function fetchFrameItems(itemId: string): Promise<DetectedItem[]> {
@@ -82,6 +105,10 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const streamTimerRef = useRef<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const scanIntervalSecondsRef = useRef(2);
+  const [findCriteria, setFindCriteria] = useState(() =>
+    window.localStorage.getItem(FIND_CRITERIA_STORAGE_KEY) ?? "",
+  );
+  const findCriteriaRef = useRef(findCriteria);
   const [source, setSource] = useState<Source>("camera");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
@@ -97,7 +124,20 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const [stillPreviewUrl, setStillPreviewUrl] = useState<string | null>(null);
   const [snapshotFlash, setSnapshotFlash] = useState(0);
   const [scanIntervalSeconds, setScanIntervalSeconds] = useState(2);
+  const [maxConcurrentFrames, setMaxConcurrentFrames] = useState(() => {
+    const saved = Number(window.localStorage.getItem("yard-sale-max-concurrent-frames"));
+    return Number.isInteger(saved) && saved >= 1 && saved <= MAX_CONCURRENT_FRAMES_SETTING
+      ? saved
+      : DEFAULT_MAX_CONCURRENT_FRAMES;
+  });
+  const maxConcurrentFramesRef = useRef(maxConcurrentFrames);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [historySearch, setHistorySearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(historySearch.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [historySearch]);
   const [deletingItemId, setDeletingItemId] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -109,12 +149,26 @@ export default function App({ children }: { children?: React.ReactNode }) {
     ? "history"
     : "scan";
   const { data: stats = EMPTY_STATS } = useQuery({ queryKey: ["stats"], queryFn: fetchStats });
-  const { data: historyItems = [] } = useQuery({ queryKey: ["items"], queryFn: fetchItems });
+  const history = useHistory(debouncedSearch, view === "history");
+  const savedFinds = useHistory("", settingsOpen);
+  const historyItems = useMemo(() =>
+    [...new Map(history.data?.pages.flatMap((page) => page.items).map((item) => [item.id, item]) ?? []).values()],
+  [history.data]);
+  const settingsItems = useMemo(() =>
+    [...new Map(savedFinds.data?.pages.flatMap((page) => page.items).map((item) => [item.id, item]) ?? []).values()],
+  [savedFinds.data]);
+  const searchPending = historySearch.trim() !== debouncedSearch;
   const { data: routedFrameItems = [] } = useQuery({
     queryKey: ["frame-items", itemId],
     queryFn: () => fetchFrameItems(itemId!),
     enabled: Boolean(itemId),
   });
+
+  const updateFindCriteria = (nextCriteria: string) => {
+    findCriteriaRef.current = nextCriteria;
+    setFindCriteria(nextCriteria);
+    window.localStorage.setItem(FIND_CRITERIA_STORAGE_KEY, nextCriteria);
+  };
 
   const refreshHistory = useCallback(
     async () => queryClient.invalidateQueries({ queryKey: ["items"] }),
@@ -127,6 +181,11 @@ export default function App({ children }: { children?: React.ReactNode }) {
       void audioContextRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    maxConcurrentFramesRef.current = maxConcurrentFrames;
+    window.localStorage.setItem("yard-sale-max-concurrent-frames", String(maxConcurrentFrames));
+  }, [maxConcurrentFrames]);
 
   const startItemStream = useCallback(() => {
     if (streamTimerRef.current !== null) return;
@@ -222,13 +281,14 @@ export default function App({ children }: { children?: React.ReactNode }) {
 
   const submitBlob = useCallback(
     async (activeSessionId: string, blob: Blob) => {
-      if (inFlightRef.current >= MAX_CONCURRENT_FRAMES) return;
+      if (inFlightRef.current >= maxConcurrentFramesRef.current) return;
       inFlightRef.current += 1;
       setInFlight(inFlightRef.current);
       try {
         const form = new FormData();
         form.set("sessionId", activeSessionId);
         form.set("capturedAt", new Date().toISOString());
+        form.set("findCriteria", findCriteriaRef.current);
         form.set("image", blob, "frame.jpg");
         const response = await fetch("/api/analyze", { method: "POST", body: form });
         const body = (await response.json()) as AnalysisResponse | { error?: string };
@@ -257,7 +317,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
     async (activeSessionId: string, onCaptured?: () => void) => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (!video || !canvas || video.readyState < 2 || inFlightRef.current >= MAX_CONCURRENT_FRAMES) return;
+      if (!video || !canvas || video.readyState < 2 || inFlightRef.current >= maxConcurrentFramesRef.current) return;
       if (video.currentTime === lastVideoTimeRef.current) return;
       lastVideoTimeRef.current = video.currentTime;
 
@@ -472,18 +532,16 @@ export default function App({ children }: { children?: React.ReactNode }) {
       to: "/finds/$itemId",
       params: { itemId: selected.id },
       search: { from: sourceView },
+      resetScroll: false,
     });
   };
 
   const deleteFind = async (item: DetectedItem) => {
-    if (!window.confirm(`Delete “${item.name}”? This cannot be undone.`)) return;
     setDeletingItemId(item.id);
     try {
       await deleteFindRequest(item.id);
       setLiveItems((current) => current.filter((candidate) => candidate.id !== item.id));
-      queryClient.setQueryData<DetectedItem[]>(["items"], (current = []) =>
-        current.filter((candidate) => candidate.id !== item.id),
-      );
+      await refreshHistory();
       setError(null);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : "Could not delete this find.");
@@ -493,12 +551,11 @@ export default function App({ children }: { children?: React.ReactNode }) {
   };
 
   const deleteAllFinds = async () => {
-    if (!window.confirm(`Delete all ${historyItems.length} saved finds? This cannot be undone.`)) return;
     setDeletingItemId("all");
     try {
       await deleteAllFindsRequest();
       setLiveItems([]);
-      queryClient.setQueryData<DetectedItem[]>(["items"], []);
+      await queryClient.resetQueries({ queryKey: ["items"] });
       setSettingsOpen(false);
       setError(null);
     } catch (deleteError) {
@@ -549,9 +606,9 @@ export default function App({ children }: { children?: React.ReactNode }) {
             </header>
 
             <section className="stats-ribbon" aria-label="Live processing statistics">
-              <div className="stat active-stat" title={`${inFlight} of ${MAX_CONCURRENT_FRAMES} requests active`}>
+              <div className="stat active-stat" title={`${inFlight} of ${maxConcurrentFrames} requests active`}>
                 {inFlight > 0 ? <LoaderCircle className="spin" size={12} /> : <Gauge size={12} />}
-                <strong>{inFlight}/{MAX_CONCURRENT_FRAMES}</strong>
+                <strong>{inFlight}/{maxConcurrentFrames}</strong>
                 <span>Active</span>
               </div>
               <Stat label="Frames" value={stats.framesProcessed} />
@@ -608,24 +665,32 @@ export default function App({ children }: { children?: React.ReactNode }) {
             <Stat label="Searches" value={stats.searchesPerformed} />
             <Stat label="Calls" value={stats.modelCalls} />
           </section>
+          <div className="history-search">
+            <Search size={18} aria-hidden="true" />
+            <input type="search" aria-label="Search all history" placeholder="Search all finds, brands, descriptions…"
+              maxLength={500} value={historySearch} onChange={(event) => setHistorySearch(event.target.value)} />
+            {historySearch && <button onClick={() => setHistorySearch("")} aria-label="Clear history search"><X size={18} /></button>}
+          </div>
           {error && (
             <div className="error-banner history-error">
               <span>{error}</span>
               <button onClick={() => setError(null)} aria-label="Dismiss error"><X size={16} /></button>
             </div>
           )}
-          <section className="finds-section">
+          <section className="finds-section" aria-busy={history.isFetching || searchPending}>
+            <HistoryLoading query={history} searchPending={searchPending} />
             <div className="item-feed">
               {displayedItems.map((item) => (
-                <ItemCard key={`${item.id}-history`} item={item} onSelect={(selected) => openItem(selected, "history")} />
+                <ItemCard key={`${item.id}-history`} item={item} showCapturedAt onSelect={(selected) => openItem(selected, "history")} />
               ))}
-              {displayedItems.length === 0 && (
+              {displayedItems.length === 0 && !history.isPending && !history.isError && !searchPending && (
                 <div className="empty-feed">
                   <CircleDollarSign size={36} />
-                  <p>No saved finds yet.</p>
+                  <p>{debouncedSearch ? "No finds match your search." : "No saved finds yet."}</p>
                 </div>
               )}
             </div>
+            <HistoryLoadMore query={history} disabled={searchPending} />
           </section>
         </main>
       )}
@@ -661,25 +726,6 @@ export default function App({ children }: { children?: React.ReactNode }) {
               }}
             />
           </label>
-          <details className="dock-frequency">
-            <summary className="dock-action" aria-label={`Scan every ${scanIntervalSeconds} seconds`}>
-              <Gauge size={20} />
-              <span>{scanIntervalSeconds}s</span>
-            </summary>
-            <div className="frequency-popover">
-              <strong>Every {scanIntervalSeconds}s</strong>
-              <input
-                type="range"
-                min="1"
-                max="20"
-                step="1"
-                value={scanIntervalSeconds}
-                onChange={(event) => changeScanInterval(Number(event.target.value))}
-                aria-label={`Scan every ${scanIntervalSeconds} seconds`}
-              />
-              <span><b>1s</b><b>20s</b></span>
-            </div>
-          </details>
         </>}
         <Link to="/history" className={view === "history" ? "active" : ""} onClick={() => void refreshHistory()}>
           <Archive /> <span>History</span>
@@ -703,7 +749,64 @@ export default function App({ children }: { children?: React.ReactNode }) {
               <button onClick={() => setSettingsOpen(false)} aria-label="Close settings"><X size={18} /></button>
             </header>
             <div className="settings-find-list">
-              {historyItems.map((item) => (
+              <div className="settings-text-field">
+                <label htmlFor="find-criteria">Find criteria</label>
+                <textarea
+                  id="find-criteria"
+                  rows={3}
+                  maxLength={1000}
+                  value={findCriteria}
+                  placeholder="Vintage band tees worth more than $40"
+                  onChange={(event) => updateFindCriteria(event.target.value)}
+                />
+                <div className="criteria-presets" aria-label="Quick find criteria">
+                  {FIND_CRITERIA_PRESETS.map((preset) => (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      className={findCriteria === preset.value ? "active" : ""}
+                      onClick={() => updateFindCriteria(preset.value)}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                  {findCriteria && <button type="button" onClick={() => updateFindCriteria("")}>Clear</button>}
+                </div>
+              </div>
+              <div className="settings-range">
+                <label htmlFor="concurrent-processing">
+                  <span>Concurrent processing</span>
+                  <strong>{maxConcurrentFrames}</strong>
+                </label>
+                <input
+                  id="concurrent-processing"
+                  type="range"
+                  min="1"
+                  max={MAX_CONCURRENT_FRAMES_SETTING}
+                  step="1"
+                  value={maxConcurrentFrames}
+                  onChange={(event) => setMaxConcurrentFrames(Number(event.target.value))}
+                />
+                <div><span>1</span><span>{MAX_CONCURRENT_FRAMES_SETTING}</span></div>
+              </div>
+              <div className="settings-range">
+                <label htmlFor="scan-frequency">
+                  <span>Live scan frequency</span>
+                  <strong>{scanIntervalSeconds}s</strong>
+                </label>
+                <input
+                  id="scan-frequency"
+                  type="range"
+                  min="1"
+                  max="30"
+                  step="1"
+                  value={scanIntervalSeconds}
+                  onChange={(event) => changeScanInterval(Number(event.target.value))}
+                />
+                <div><span>1s</span><span>30s</span></div>
+              </div>
+              <HistoryLoading query={savedFinds} />
+              {settingsItems.map((item) => (
                 <div className="settings-find" key={item.id}>
                   <img src={item.thumbnailUrl} alt="" />
                   <div>
@@ -719,13 +822,14 @@ export default function App({ children }: { children?: React.ReactNode }) {
                   </button>
                 </div>
               ))}
-              {historyItems.length === 0 && <p className="settings-empty">No saved finds.</p>}
+              {settingsItems.length === 0 && !savedFinds.isPending && !savedFinds.isError && <p className="settings-empty">No saved finds.</p>}
+              <HistoryLoadMore query={savedFinds} />
             </div>
             <footer>
               <button
                 className="delete-all-button"
                 onClick={() => void deleteAllFinds()}
-                disabled={historyItems.length === 0 || deletingItemId !== null}
+                disabled={settingsItems.length === 0 || deletingItemId !== null}
               >
                 {deletingItemId === "all" ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}
                 Delete all finds
@@ -749,12 +853,14 @@ export default function App({ children }: { children?: React.ReactNode }) {
                     params: { itemId: nextItem.id },
                     search: { from: view },
                     replace: true,
+                    resetScroll: false,
                   }
                 : {
                     to: "/finds/$itemId",
                     params: { itemId: nextItem.id },
                     search: { from: view },
                     replace: true,
+                    resetScroll: false,
                   },
             );
           }}
@@ -762,12 +868,12 @@ export default function App({ children }: { children?: React.ReactNode }) {
           onToggleActivity={() => {
             void navigate(
               activityOpen
-                ? { to: "/finds/$itemId", params: { itemId: selectedItem.id }, search: { from: view } }
-                : { to: "/finds/$itemId/activity", params: { itemId: selectedItem.id }, search: { from: view } },
+                ? { to: "/finds/$itemId", params: { itemId: selectedItem.id }, search: { from: view }, resetScroll: false }
+                : { to: "/finds/$itemId/activity", params: { itemId: selectedItem.id }, search: { from: view }, resetScroll: false },
             );
           }}
           onClose={() => {
-            void navigate({ to: view === "scan" ? "/scan" : "/history" });
+            void navigate({ to: view === "scan" ? "/scan" : "/history", resetScroll: false });
           }}
         />
       )}
@@ -785,15 +891,43 @@ function Stat({ label, value }: { label: string; value: number }) {
   );
 }
 
+function HistoryLoading({ query, searchPending = false }: { query: ReturnType<typeof useHistory>; searchPending?: boolean }) {
+  if (query.isError) return (
+    <div className="history-status" role="alert">
+      <span>{query.error.message}</span>
+      <button className="history-load-more" onClick={() => void (query.isFetchNextPageError ? query.fetchNextPage() : query.refetch())} disabled={query.isFetching}>Retry</button>
+    </div>
+  );
+  if (query.isFetching || searchPending) return <p className="history-status" role="status">{searchPending ? "Searching…" : "Loading finds…"}</p>;
+  return null;
+}
+
+function HistoryLoadMore({ query, disabled = false }: { query: ReturnType<typeof useHistory>; disabled?: boolean }) {
+  if (!query.hasNextPage) return null;
+  return <button className="history-load-more" disabled={disabled || query.isFetching} onClick={() => void query.fetchNextPage()}>
+    {query.isFetchingNextPage ? "Loading…" : "Load more finds"}
+  </button>;
+}
+
+function CapturedTime({ timestamp }: { timestamp?: string | null }) {
+  if (!timestamp || Number.isNaN(Date.parse(timestamp))) return null;
+  const date = new Date(timestamp);
+  return <time className="captured-time" dateTime={date.toISOString()}>
+    Snapped {date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}
+  </time>;
+}
+
 function ItemCard({
   item,
   animate,
   overlay,
+  showCapturedAt,
   onSelect,
 }: {
   item: DetectedItem;
   animate?: boolean;
   overlay?: boolean;
+  showCapturedAt?: boolean;
   onSelect: (item: DetectedItem) => void;
 }) {
   return (
@@ -809,14 +943,22 @@ function ItemCard({
         <div className="item-meta">
           <span>{item.category}</span>
           {item.duplicate && <span className="repeat-badge">Seen {item.seenCount}×</span>}
-          <RelativeTime timestamp={item.firstSeenAt} />
+          {!showCapturedAt && <RelativeTime timestamp={item.firstSeenAt} />}
         </div>
+        {showCapturedAt && <CapturedTime timestamp={item.lastSeenAt} />}
         <h3>{item.name}</h3>
         <p>{item.valueSummary}</p>
-        <div className="price-row">
-          <strong>{formatRange(item)}</strong>
-          {item.observedPriceCents !== null && <span>Tag {money(item.observedPriceCents, item.currency)}</span>}
+        <div className="price-comparison card-prices">
+          <div className="price-box resale-price">
+            <span>Resale</span>
+            <strong>{formatRange(item)}</strong>
+          </div>
+          <div className="price-box retail-price">
+            <span>Retail</span>
+            <strong>{item.retailPriceCents === null ? "—" : money(item.retailPriceCents, item.currency)}</strong>
+          </div>
         </div>
+        {item.observedPriceCents !== null && <span className="tag-price">Tag {money(item.observedPriceCents, item.currency)}</span>}
       </div>
       <ChevronRight className="card-chevron" size={20} />
     </button>
@@ -868,6 +1010,23 @@ function ItemDetail({
   onClose: () => void;
 }) {
   const [hoveredItemId, setHoveredItemId] = useState<string | null>(null);
+  const modalRef = useRef<HTMLElement>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const downloadImage = async () => {
+    if (!modalRef.current || downloading) return;
+    const modal = modalRef.current;
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      const { downloadModalImage } = await import("./download-modal");
+      await downloadModalImage(modal, `${item.name}${activityOpen ? "-activity" : ""}`);
+    } catch {
+      setDownloadError("Could not download the image. Check your connection and try again.");
+    } finally {
+      setDownloading(false);
+    }
+  };
   const frameListRef = useRef<HTMLDivElement>(null);
   const frameItemRefs = useRef(new Map<string, HTMLButtonElement>());
   const highlightedItemId = hoveredItemId ?? item.id;
@@ -891,8 +1050,12 @@ function ItemDetail({
 
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
-      <article className="detail-sheet" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="close-button" onClick={onClose} aria-label="Close"><X /></button>
+      <article ref={modalRef} className="detail-sheet" onMouseDown={(event) => event.stopPropagation()}>
+        <button className="download-image-button" data-export-exclude onClick={() => void downloadImage()} disabled={downloading} aria-label={downloading ? "Downloading image" : "Download modal as image"}>
+          {downloading ? <LoaderCircle className="spin" size={18} /> : <Download size={18} />}
+          {downloading ? "Preparing…" : "Download image"}
+        </button>
+        <button className="close-button" data-export-exclude onClick={onClose} aria-label="Close"><X /></button>
         <div className="detail-scroll">
           <div className="detail-visual">
             <AnnotatedImage
@@ -903,6 +1066,7 @@ function ItemDetail({
             />
           </div>
           <div className="detail-content">
+          {downloadError && <p className="download-image-error" data-export-exclude role="alert">{downloadError}</p>}
           <p className="eyebrow">{frameItems.length} item{frameItems.length === 1 ? "" : "s"} found in this frame</p>
           <div ref={frameListRef} className="frame-find-list">
             {frameItems.map((frameItem) => (
@@ -923,7 +1087,7 @@ function ItemDetail({
               </button>
             ))}
           </div>
-          <button className="agent-activity-toggle" onClick={onToggleActivity}>
+          <button className="agent-activity-toggle" data-export-exclude onClick={onToggleActivity}>
             <Bot size={17} /> {activityOpen ? "Back to find" : "Agent activity"}
           </button>
           {activityOpen ? (
@@ -933,13 +1097,22 @@ function ItemDetail({
               <p className="eyebrow">{item.category} · {Math.round(item.confidence * 100)}% confidence</p>
               <h2>{item.name}</h2>
               <p className="detail-description">{item.description}</p>
-              <div className="value-hero">
-                <span>Estimated resale</span>
-                <strong>{formatRange(item)}</strong>
+              <div className="detail-values">
+                <div className="price-comparison">
+                  <div className="price-box resale-price">
+                    <span>Estimated resale</span>
+                    <strong>{formatRange(item)}</strong>
+                  </div>
+                  <div className="price-box retail-price">
+                    <span>Estimated retail</span>
+                    <strong>{item.retailPriceCents === null ? "—" : money(item.retailPriceCents, item.currency)}</strong>
+                  </div>
+                </div>
                 <p>{item.valueSummary}</p>
               </div>
               <a
                 className="lens-search-link"
+                data-export-exclude
                 href={`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(new URL(item.thumbnailUrl, window.location.origin).href)}`}
                 target="_blank"
                 rel="noreferrer"

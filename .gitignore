@@ -8,5 +8,20 @@ dist
 .DS_Store
 coverage
 
+# Local environment, credentials, and runtime artifacts.
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+
 # Source footage is intentionally local and should not be bundled or committed.
 yard-sale-footage/
