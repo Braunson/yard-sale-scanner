@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Unit tests use vitest.config.ts, so they need no Cloudflare or API credentials.
+      - run: npm test
+      # Type-checks the app and the Worker, then builds the client and Worker bundles.
+      - run: npm run build

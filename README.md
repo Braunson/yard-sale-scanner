@@ -86,6 +86,8 @@ npm run db:generate      # generate a migration after schema changes
 npm run db:migrate:local # apply migrations to local D1
 ```
 
+GitHub Actions runs `npm test` and `npm run build` on every pull request and on pushes to `main` (`.github/workflows/ci.yml`). Neither step needs secrets.
+
 ## Agent workflow
 
 Each frame runs through three steps, and results stream back as NDJSON so quick prices appear before research finishes:

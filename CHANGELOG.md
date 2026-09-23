@@ -29,6 +29,7 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
 - **Migration `0004_two_stage_pricing`**: `online_sale_cents`, `shipping_cents`, `pricing_path`, `pricing_status`, `triage_source`, `triage_confidence`, `research_reason`, `researched_at`, `research_started_at`.
 - Unit tests for pricing math, the detection gate, and triage (33 tests in total).
 - `vitest.config.ts`, so `npm test` runs without Cloudflare credentials.
+- GitHub Actions CI (`.github/workflows/ci.yml`): `npm ci`, `npm test`, and `npm run build` on every pull request and on pushes to `main`.
 
 ### Changed
 
