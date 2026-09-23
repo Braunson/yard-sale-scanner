@@ -25,3 +25,6 @@ coverage
 
 # Source footage is intentionally local and should not be bundled or committed.
 yard-sale-footage/
+
+# oh-my-claudecode runtime state.
+.omc/

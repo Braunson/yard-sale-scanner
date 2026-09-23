@@ -9,6 +9,7 @@ import {
   Download,
   ExternalLink,
   Gauge,
+  Globe,
   History,
   ImageUp,
   LoaderCircle,
@@ -16,12 +17,17 @@ import {
   Search,
   Settings,
   Square,
+  Store,
   Trash2,
   Video,
   X,
+  Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AgentRunHistory, AnalysisResponse, DetectedItem, HistoryPage, Stats } from "./types";
+import { gateFrame, sellableDetections } from "./detection";
+import { detectVideoFrame, loadDetector } from "./detector";
+import { MARKETPLACE_FEE_RATE, MARKETPLACE_FIXED_FEE_CENTS, localResaleCents, onlineOutlook, tagMargin } from "./pricing";
+import type { AgentRunHistory, AnalysisEvent, DetectedItem, DeviceDetection, HistoryPage, Stats } from "./types";
 
 const EMPTY_STATS: Stats = {
   framesProcessed: 0,
@@ -33,6 +39,10 @@ const EMPTY_STATS: Stats = {
 const DEFAULT_MAX_CONCURRENT_FRAMES = 5;
 const MAX_CONCURRENT_FRAMES_SETTING = 100;
 const FIND_CRITERIA_STORAGE_KEY = "yard-sale-find-criteria";
+const DEVICE_DETECTION_STORAGE_KEY = "yard-sale-device-detection";
+const DETECTION_INTERVAL_MS = 200;
+/** A still scene is re-sent after this long, because COCO does not know many sale items. */
+const MAX_QUIET_MS = 20_000;
 const FIND_CRITERIA_PRESETS = [
   { label: "Vintage tees", value: "Vintage band tees worth more than $40" },
   { label: "Modern electronics", value: "Electronics that are still modern enough to use" },
@@ -44,6 +54,33 @@ const FIND_CRITERIA_PRESETS = [
 
 type View = "scan" | "history";
 type Source = "camera" | "video" | "image";
+type DetectorStatus = "off" | "loading" | "ready" | "failed";
+
+async function readAnalysisStream(body: ReadableStream<Uint8Array>, onEvent: (event: AnalysisEvent) => void) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let finished = false;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      buffered += decoder.decode(value, { stream: !done });
+      const lines = buffered.split("\n");
+      buffered = done ? "" : lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const event = JSON.parse(line) as AnalysisEvent;
+        if (event.type === "done" || event.type === "error") finished = true;
+        onEvent(event);
+      }
+      if (done) break;
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+  if (!finished) throw new Error("The connection closed before analysis finished.");
+}
 
 async function fetchStats(): Promise<Stats> {
   const response = await fetch("/api/stats");
@@ -112,6 +149,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const [source, setSource] = useState<Source>("camera");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  /** True after an uploaded video plays to its end; the detector stops on its last frame. */
+  const [mediaEnded, setMediaEnded] = useState(false);
   const [inFlight, setInFlight] = useState(0);
   const [liveItems, setLiveItems] = useState<DetectedItem[]>([]);
   const [streamItemTokens, setStreamItemTokens] = useState<Record<string, number>>({});
@@ -131,6 +170,22 @@ export default function App({ children }: { children?: React.ReactNode }) {
       : DEFAULT_MAX_CONCURRENT_FRAMES;
   });
   const maxConcurrentFramesRef = useRef(maxConcurrentFrames);
+  const [deviceDetectionEnabled, setDeviceDetectionEnabled] = useState(
+    () => window.localStorage.getItem(DEVICE_DETECTION_STORAGE_KEY) !== "off",
+  );
+  const deviceDetectionEnabledRef = useRef(deviceDetectionEnabled);
+  const [detectorStatus, setDetectorStatus] = useState<DetectorStatus>("off");
+  const [liveDetections, setLiveDetections] = useState<{
+    detections: DeviceDetection[];
+    width: number;
+    height: number;
+    unitsPerPixel: number;
+  } | null>(null);
+  const latestDetectionsRef = useRef<DeviceDetection[] | null>(null);
+  const lastSentDetectionsRef = useRef<DeviceDetection[] | null>(null);
+  const lastSentAtRef = useRef(0);
+  const [skippedFrames, setSkippedFrames] = useState(0);
+  const [researching, setResearching] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -181,6 +236,11 @@ export default function App({ children }: { children?: React.ReactNode }) {
       void audioContextRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    deviceDetectionEnabledRef.current = deviceDetectionEnabled;
+    window.localStorage.setItem(DEVICE_DETECTION_STORAGE_KEY, deviceDetectionEnabled ? "on" : "off");
+  }, [deviceDetectionEnabled]);
 
   useEffect(() => {
     maxConcurrentFramesRef.current = maxConcurrentFrames;
@@ -279,46 +339,104 @@ export default function App({ children }: { children?: React.ReactNode }) {
     return () => navigator.mediaDevices?.removeEventListener("devicechange", refreshCameras);
   }, [refreshCameras]);
 
+  const applyResearchedItems = useCallback((researched: DetectedItem[]) => {
+    const byId = new Map(researched.map((item) => [item.id, item]));
+    streamQueueRef.current = streamQueueRef.current.map((item) => byId.get(item.id) ?? item);
+    setLiveItems((current) => current.map((item) => byId.get(item.id) ?? item));
+    setSelectedItem((current) => (current && byId.get(current.id)) ?? current);
+    setSelectedFrameItems((current) => current.map((item) => byId.get(item.id) ?? item));
+    queryClient.setQueriesData<DetectedItem[]>(
+      { queryKey: ["frame-items"] },
+      (current) => current?.map((item) => byId.get(item.id) ?? item),
+    );
+  }, [queryClient]);
+
   const submitBlob = useCallback(
-    async (activeSessionId: string, blob: Blob) => {
+    async (activeSessionId: string, blob: Blob, deviceDetections: DeviceDetection[] = []) => {
       if (inFlightRef.current >= maxConcurrentFramesRef.current) return;
       inFlightRef.current += 1;
       setInFlight(inFlightRef.current);
+      // The concurrency slot is released once quick prices arrive; research continues in the background.
+      let slotHeld = true;
+      let researchPending = false;
+      const releaseSlot = () => {
+        if (!slotHeld) return;
+        slotHeld = false;
+        inFlightRef.current -= 1;
+        setInFlight(inFlightRef.current);
+      };
       try {
         const form = new FormData();
         form.set("sessionId", activeSessionId);
         form.set("capturedAt", new Date().toISOString());
         form.set("findCriteria", findCriteriaRef.current);
+        if (deviceDetections.length > 0) form.set("deviceDetections", JSON.stringify(deviceDetections));
         form.set("image", blob, "frame.jpg");
         const response = await fetch("/api/analyze", { method: "POST", body: form });
-        const body = (await response.json()) as AnalysisResponse | { error?: string };
-        if (!response.ok) throw new Error("error" in body ? body.error : "Frame analysis failed");
-
-        const result = body as AnalysisResponse;
-        queryClient.setQueryData(["stats"], result.stats);
-        if (result.items.length > 0) {
-          streamQueueRef.current.push(...result.items);
-          startItemStream();
-          playFoundSound();
-          void refreshHistory();
+        if (!response.ok || !response.body) {
+          const body = (await response.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error ?? "Frame analysis failed");
         }
+
+        let streamError: string | null = null;
+        await readAnalysisStream(response.body, (event) => {
+          if (event.type === "items" && event.phase === "identified") {
+            releaseSlot();
+            if (event.items.some((item) => item.pricingStatus === "researching")) {
+              researchPending = true;
+              setResearching((current) => current + 1);
+            }
+            if (event.items.length > 0) {
+              streamQueueRef.current.push(...event.items);
+              startItemStream();
+              playFoundSound();
+              void refreshHistory();
+            }
+          } else if (event.type === "items") {
+            applyResearchedItems(event.items);
+            void refreshHistory();
+          } else if (event.type === "done") {
+            queryClient.setQueryData(["stats"], event.stats);
+          } else {
+            streamError = event.error;
+          }
+        });
+        if (streamError) throw new Error(streamError);
         setError(null);
       } catch (frameError) {
         setError(frameError instanceof Error ? frameError.message : "Frame analysis failed");
       } finally {
-        inFlightRef.current -= 1;
-        setInFlight(inFlightRef.current);
+        releaseSlot();
+        if (researchPending) setResearching((current) => current - 1);
       }
     },
-    [playFoundSound, queryClient, refreshHistory, startItemStream],
+    [applyResearchedItems, playFoundSound, queryClient, refreshHistory, startItemStream],
   );
 
   const submitFrame = useCallback(
-    async (activeSessionId: string, onCaptured?: () => void) => {
+    async (activeSessionId: string, onCaptured?: () => void, { gated = false } = {}) => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       if (!video || !canvas || video.readyState < 2 || inFlightRef.current >= maxConcurrentFramesRef.current) return;
       if (video.currentTime === lastVideoTimeRef.current) return;
+
+      // Automatic captures skip frames where the on-device detector sees nothing new.
+      const detections = deviceDetectionEnabledRef.current ? latestDetectionsRef.current : null;
+      if (gated && detections) {
+        const decision = gateFrame({
+          detections,
+          lastSent: lastSentDetectionsRef.current,
+          msSinceLastSent: Date.now() - lastSentAtRef.current,
+          maxQuietMs: MAX_QUIET_MS,
+        });
+        if (!decision.send) {
+          setSkippedFrames((current) => current + 1);
+          return;
+        }
+      }
+      const hints = detections ? sellableDetections(detections) : [];
+      lastSentDetectionsRef.current = hints;
+      lastSentAtRef.current = Date.now();
       lastVideoTimeRef.current = video.currentTime;
 
       const scale = Math.min(1, 960 / video.videoWidth);
@@ -330,7 +448,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
       onCaptured?.();
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.76));
       if (!blob) return;
-      await submitBlob(activeSessionId, blob);
+      await submitBlob(activeSessionId, blob, hints);
     },
     [submitBlob],
   );
@@ -379,8 +497,9 @@ export default function App({ children }: { children?: React.ReactNode }) {
 
   const startLiveScan = (activeSessionId: string) => {
     setScanning(true);
+    lastSentDetectionsRef.current = null;
     intervalRef.current = window.setInterval(
-      () => void submitFrame(activeSessionId, playSnapshotFeedback),
+      () => void submitFrame(activeSessionId, playSnapshotFeedback, { gated: true }),
       scanIntervalSecondsRef.current * 1_000,
     );
     window.setTimeout(() => void submitFrame(activeSessionId, playSnapshotFeedback), 350);
@@ -392,7 +511,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
     if (!scanning || !sessionId) return;
     if (intervalRef.current !== null) window.clearInterval(intervalRef.current);
     intervalRef.current = window.setInterval(
-      () => void submitFrame(sessionId, playSnapshotFeedback),
+      () => void submitFrame(sessionId, playSnapshotFeedback, { gated: true }),
       seconds * 1_000,
     );
   };
@@ -498,6 +617,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
   };
 
   function stopMedia() {
+    setMediaEnded(false);
     if (intervalRef.current !== null) window.clearInterval(intervalRef.current);
     intervalRef.current = null;
     setScanning(false);
@@ -513,6 +633,73 @@ export default function App({ children }: { children?: React.ReactNode }) {
     objectUrlRef.current = null;
     lastVideoTimeRef.current = -1;
   }
+
+  const detectorActive =
+    view === "scan" && deviceDetectionEnabled && Boolean(sessionId) && source !== "image" && !mediaEnded;
+  useEffect(() => {
+    if (!detectorActive) {
+      latestDetectionsRef.current = null;
+      setLiveDetections(null);
+      setDetectorStatus("off");
+      return;
+    }
+    let cancelled = false;
+    let frameRequest = 0;
+    let lastRun = 0;
+    let lastOverlayKey = "";
+    setDetectorStatus("loading");
+    loadDetector()
+      .then((detector) => {
+        if (cancelled) return;
+        setDetectorStatus("ready");
+        const tick = (now: number) => {
+          if (cancelled) return;
+          frameRequest = window.requestAnimationFrame(tick);
+          if (now - lastRun < DETECTION_INTERVAL_MS) return;
+          lastRun = now;
+          const video = videoRef.current;
+          if (!video || video.readyState < 2) {
+            latestDetectionsRef.current = null;
+            lastOverlayKey = "";
+            setLiveDetections(null);
+            return;
+          }
+          let detections: DeviceDetection[];
+          try {
+            detections = detectVideoFrame(detector, video, now);
+          } catch {
+            cancelled = true;
+            latestDetectionsRef.current = null;
+            setLiveDetections(null);
+            setDetectorStatus("failed");
+            return;
+          }
+          latestDetectionsRef.current = detections;
+          const shown = sellableDetections(detections);
+          // Only re-render when the boxes change, to leave the CPU and GPU for the detector.
+          const overlayKey = `${video.clientWidth}x${video.clientHeight}|${shown
+            .map((detection) => `${detection.label}:${Object.values(detection.box).map((value) => Math.round(value / 10)).join(",")}`)
+            .join(";")}`;
+          if (overlayKey === lastOverlayKey) return;
+          lastOverlayKey = overlayKey;
+          setLiveDetections({
+            detections: shown,
+            width: video.videoWidth,
+            height: video.videoHeight,
+            // With "slice" (object-fit: cover) one CSS pixel is this many video pixels.
+            unitsPerPixel: 1 / Math.max(video.clientWidth / video.videoWidth, video.clientHeight / video.videoHeight),
+          });
+        };
+        frameRequest = window.requestAnimationFrame(tick);
+      })
+      .catch(() => {
+        if (!cancelled) setDetectorStatus("failed");
+      });
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frameRequest);
+    };
+  }, [detectorActive]);
 
   const displayedItems = view === "scan" ? liveItems : historyItems;
 
@@ -570,7 +757,40 @@ export default function App({ children }: { children?: React.ReactNode }) {
       {view === "scan" ? (
         <main className="immersive-scan">
           <section className="camera-stage">
-            <video ref={videoRef} playsInline onEnded={stopScan} />
+            <video ref={videoRef} playsInline onEnded={() => { stopScan(); setMediaEnded(true); }} />
+            {liveDetections && liveDetections.width > 0 && (
+              <svg
+                className="detection-overlay"
+                viewBox={`0 0 ${liveDetections.width} ${liveDetections.height}`}
+                preserveAspectRatio="xMidYMid slice"
+                aria-hidden="true"
+              >
+                {liveDetections.detections.map((detection, index) => {
+                  const x = (detection.box.xMin / 1000) * liveDetections.width;
+                  const y = (detection.box.yMin / 1000) * liveDetections.height;
+                  return (
+                    <g key={`${detection.label}-${index}`}>
+                      <rect
+                        x={x}
+                        y={y}
+                        width={((detection.box.xMax - detection.box.xMin) / 1000) * liveDetections.width}
+                        height={((detection.box.yMax - detection.box.yMin) / 1000) * liveDetections.height}
+                        rx={6 * liveDetections.unitsPerPixel}
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      <text
+                        x={x + 6 * liveDetections.unitsPerPixel}
+                        y={y + 18 * liveDetections.unitsPerPixel}
+                        fontSize={14 * liveDetections.unitsPerPixel}
+                        strokeWidth={3 * liveDetections.unitsPerPixel}
+                      >
+                        {detection.label}
+                      </text>
+                    </g>
+                  );
+                })}
+              </svg>
+            )}
             {stillPreviewUrl && <img className="still-preview" src={stillPreviewUrl} alt="Uploaded frame" />}
             {!sessionId && (
               <div className="camera-empty">
@@ -611,6 +831,19 @@ export default function App({ children }: { children?: React.ReactNode }) {
                 <strong>{inFlight}/{maxConcurrentFrames}</strong>
                 <span>Active</span>
               </div>
+              {researching > 0 && (
+                <div className="stat research-stat" title="Frames with items still being researched">
+                  <Search size={12} />
+                  <strong>{researching}</strong>
+                  <span>Researching</span>
+                </div>
+              )}
+              {detectorStatus === "ready" && skippedFrames > 0 && (
+                <div className="stat" title="Frames skipped by on-device detection because nothing new was in view">
+                  <strong>{skippedFrames.toLocaleString()}</strong>
+                  <span>Skipped</span>
+                </div>
+              )}
               <Stat label="Frames" value={stats.framesProcessed} />
               <Stat label="Items" value={stats.itemsIdentified} />
               <Stat label="Searches" value={stats.searchesPerformed} />
@@ -773,6 +1006,21 @@ export default function App({ children }: { children?: React.ReactNode }) {
                   {findCriteria && <button type="button" onClick={() => updateFindCriteria("")}>Clear</button>}
                 </div>
               </div>
+              <label className="settings-toggle">
+                <input
+                  type="checkbox"
+                  checked={deviceDetectionEnabled}
+                  onChange={(event) => setDeviceDetectionEnabled(event.target.checked)}
+                />
+                <span>
+                  <strong>On-device detection</strong>
+                  <small>
+                    Finds objects in the browser and skips live frames with nothing new in view.
+                    {detectorStatus === "loading" && " Loading model…"}
+                    {detectorStatus === "failed" && " The model could not load, so every frame is sent."}
+                  </small>
+                </span>
+              </label>
               <div className="settings-range">
                 <label htmlFor="concurrent-processing">
                   <span>Concurrent processing</span>
@@ -958,7 +1206,11 @@ function ItemCard({
             <strong>{item.retailPriceCents === null ? "—" : money(item.retailPriceCents, item.currency)}</strong>
           </div>
         </div>
-        {item.observedPriceCents !== null && <span className="tag-price">Tag {money(item.observedPriceCents, item.currency)}</span>}
+        <div className="card-badges">
+          <PricingBadge item={item} />
+          <OnlineBadge item={item} />
+          {item.observedPriceCents !== null && <span className="tag-price">Tag {money(item.observedPriceCents, item.currency)}</span>}
+        </div>
       </div>
       <ChevronRight className="card-chevron" size={20} />
     </button>
@@ -1108,8 +1360,11 @@ function ItemDetail({
                     <strong>{item.retailPriceCents === null ? "—" : money(item.retailPriceCents, item.currency)}</strong>
                   </div>
                 </div>
+                <PricingPathPanel item={item} />
                 <p>{item.valueSummary}</p>
               </div>
+              <PriceBreakdown item={item} />
+              <OnlineOutlookPanel item={item} />
               <a
                 className="lens-search-link"
                 data-export-exclude
@@ -1143,7 +1398,9 @@ function ItemDetail({
                 <div><dt>Brand</dt><dd>{item.brand ?? "Unknown"}</dd></div>
                 <div><dt>Model</dt><dd>{item.model ?? "Unknown"}</dd></div>
                 <div><dt>Condition</dt><dd>{item.condition}</dd></div>
+                <div><dt>Category</dt><dd>{item.category}</dd></div>
                 <div><dt>Seen</dt><dd>{item.seenCount} time{item.seenCount === 1 ? "" : "s"}</dd></div>
+                <div><dt>First seen</dt><dd>{new Date(item.firstSeenAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</dd></div>
               </dl>
             </>
           )}
@@ -1326,6 +1583,131 @@ function AnnotatedImage({
         </svg>
       )}
     </div>
+  );
+}
+
+function PricingBadge({ item }: { item: DetectedItem }) {
+  if (item.pricingStatus === "researching") {
+    return <span className="pricing-badge researching"><LoaderCircle className="spin" size={10} /> Researching</span>;
+  }
+  if (item.pricingStatus === "research_failed") return <span className="pricing-badge failed">Quick estimate</span>;
+  if (item.pricingPath === "instant") return <span className="pricing-badge instant"><Zap size={10} /> Instant</span>;
+  return <span className="pricing-badge researched"><Search size={10} /> Researched</span>;
+}
+
+function OnlineBadge({ item }: { item: DetectedItem }) {
+  const outlook = onlineOutlook(item);
+  if (!outlook || outlook.verdict !== "online") return null;
+  return <span className="online-badge"><Globe size={10} /> +{money(outlook.premiumCents, item.currency)} online</span>;
+}
+
+function PricingPathPanel({ item }: { item: DetectedItem }) {
+  const decidedBy = {
+    jev: "Jev",
+    luna: "Luna",
+    reused: "An earlier scan",
+    config: "The research-all setting",
+  }[item.triageSource];
+  const certainty = item.triageConfidence === null ? "" : ` (${Math.round(item.triageConfidence * 100)}% sure)`;
+  let title: string;
+  let detail: string;
+  if (item.pricingStatus === "researching") {
+    title = "Quick estimate · researching now";
+    detail = `${decidedBy} flagged this item for web and marketplace research${certainty}. Prices update when research finishes.`;
+  } else if (item.pricingStatus === "research_failed") {
+    title = "Quick estimate · research did not finish";
+    detail = "These prices come from Luna's general knowledge only. Check the comps before you buy.";
+  } else if (item.triageSource === "reused") {
+    title = "Researched earlier";
+    detail = "This item was researched on an earlier scan, so its prices were reused without new searches.";
+  } else if (item.pricingPath === "instant") {
+    title = "Priced instantly";
+    detail = `${decidedBy} decided this item does not need research${certainty}. The price comes from general knowledge.`;
+  } else {
+    title = "Researched price";
+    detail = `${decidedBy} sent this item to research${certainty}. Prices use retailer, eBay, and sold evidence.`;
+  }
+
+  return (
+    <div className={`pricing-path ${item.pricingStatus}`}>
+      <PricingBadge item={item} />
+      <div>
+        <strong>{title}</strong>
+        <span>{detail}</span>
+        {item.researchReason && <em>{item.researchReason}</em>}
+      </div>
+    </div>
+  );
+}
+
+function PriceBreakdown({ item }: { item: DetectedItem }) {
+  const margin = tagMargin(item);
+  const rows: Array<{ label: string; value: string; tone?: "good" | "bad" }> = [];
+  if (item.observedPriceCents !== null) rows.push({ label: "Tag price", value: money(item.observedPriceCents, item.currency) });
+  if (margin) {
+    rows.push({
+      label: "Profit at tag",
+      value: `${margin.profitCents < 0 ? "−" : ""}${money(Math.abs(margin.profitCents), item.currency)}${
+        margin.roi === null ? "" : ` · ${Math.round(margin.roi * 100)}% ROI`
+      }`,
+      tone: margin.profitCents > 0 ? "good" : "bad",
+    });
+  }
+  if (item.soldPriceCents !== null) rows.push({ label: "Sold online", value: money(item.soldPriceCents, item.currency) });
+  if (item.activePriceCents !== null) rows.push({ label: "Listed online", value: money(item.activePriceCents, item.currency) });
+  if (item.retailPriceCents !== null) {
+    const local = localResaleCents(item);
+    if (local !== null && item.retailPriceCents > 0) {
+      rows.push({ label: "Resale vs retail", value: `${Math.round((local / item.retailPriceCents) * 100)}% of new` });
+    }
+  }
+  if (rows.length === 0) return null;
+
+  return (
+    <dl className="price-breakdown">
+      {rows.map((row) => (
+        <div key={row.label}>
+          <dt>{row.label}</dt>
+          <dd className={row.tone}>{row.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function OnlineOutlookPanel({ item }: { item: DetectedItem }) {
+  const outlook = onlineOutlook(item);
+  if (!outlook) {
+    return (
+      <section className="online-outlook unknown">
+        <h3><Globe size={16} /> Online or local?</h3>
+        <p>Not enough online price evidence to compare.{item.pricingStatus === "researching" ? " Research is still running." : ""}</p>
+      </section>
+    );
+  }
+
+  const headline =
+    outlook.verdict === "online"
+      ? `Sells for about ${money(outlook.premiumCents, item.currency)} more online`
+      : outlook.verdict === "local"
+        ? "Sell locally. Online nets less after fees and shipping."
+        : `About the same online (${outlook.premiumCents >= 0 ? "+" : "−"}${money(Math.abs(outlook.premiumCents), item.currency)})`;
+  const feePercent = (MARKETPLACE_FEE_RATE * 100).toFixed(2).replace(/\.?0+$/, "");
+
+  return (
+    <section className={`online-outlook ${outlook.verdict}`}>
+      <h3>{outlook.verdict === "local" ? <Store size={16} /> : <Globe size={16} />} {headline}</h3>
+      <dl>
+        <div><dt>Online sale</dt><dd>{money(outlook.onlineSaleCents, item.currency)}</dd></div>
+        <div>
+          <dt>Fees ({feePercent}% + {money(MARKETPLACE_FIXED_FEE_CENTS, item.currency)})</dt>
+          <dd>−{money(outlook.feesCents, item.currency)}</dd>
+        </div>
+        <div><dt>Shipping{item.shippingCents === null ? " (unknown)" : ""}</dt><dd>−{money(outlook.shippingCents, item.currency)}</dd></div>
+        <div className="total"><dt>Online net</dt><dd>{money(outlook.onlineNetCents, item.currency)}</dd></div>
+        <div className="total"><dt>Local sale</dt><dd>{money(outlook.localCents, item.currency)}</dd></div>
+      </dl>
+    </section>
   );
 }
 

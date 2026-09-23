@@ -113,6 +113,18 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .tag-price { display: block; margin-top: 5px; color: #85857c; font-size: 9px; }
 .card-chevron { color: rgba(255,255,255,.38); }
 .overlay-card .card-chevron { display: none; }
+.card-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; margin-top: 6px; }
+.card-badges .tag-price { margin-top: 0; }
+.pricing-badge, .online-badge { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 4px; font-size: 8px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.pricing-badge.instant { color: #3d2f07; background: #f4d87f; }
+.pricing-badge.researched { color: white; background: var(--green); }
+.pricing-badge.researching { color: white; background: #635bac; }
+.pricing-badge.failed { color: #6b271f; background: #f3c9bf; }
+.online-badge { color: white; background: #386a8c; }
+.detection-overlay { position: absolute; z-index: -2; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.detection-overlay rect { fill: rgba(246,191,52,.06); stroke: rgba(246,191,52,.85); stroke-width: 2px; }
+.detection-overlay text { fill: #ffd66b; font-family: "DM Sans",sans-serif; font-weight: 700; paint-order: stroke; stroke: rgba(0,0,0,.6); }
+.research-stat svg { color: #b9b3ff; }
 
 .error-banner { display: flex; justify-content: space-between; gap: 12px; padding: 11px 13px; color: #fff; background: rgba(139,35,32,.88); border: 1px solid rgba(255,188,181,.36); border-radius: 13px; box-shadow: 0 10px 30px rgba(0,0,0,.25); backdrop-filter: blur(16px); font-size: 12px; }
 .scan-shell .error-banner { position: absolute; z-index: 20; right: 90px; bottom: calc(88px + env(safe-area-inset-bottom)); width: min(430px, calc(100vw - 116px)); }
@@ -256,6 +268,35 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .comp-type.sold { color: white; background: var(--green); }
 .comp-type.active { color: white; background: #635bac; }
 .comp-type.web { color: white; background: #386a8c; }
+.pricing-path { display: flex; align-items: flex-start; gap: 10px; margin-top: 12px; }
+.pricing-path > div { display: grid; gap: 3px; min-width: 0; }
+.pricing-path strong { font-size: 13px; }
+.pricing-path span:not(.pricing-badge), .pricing-path em { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.pricing-path em { font-style: normal; color: #4f4f48; }
+.price-breakdown { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 0 18px; margin: 0 0 16px; color: var(--ink); }
+.price-breakdown div { display: flex; justify-content: space-between; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(23,23,19,.1); }
+.price-breakdown dt { color: var(--muted); font-size: 11px; }
+.price-breakdown dd { margin: 0; font-size: 12px; font-weight: 700; text-align: right; }
+.price-breakdown dd.good { color: var(--green); }
+.price-breakdown dd.bad { color: #9c3328; }
+.online-outlook { margin: 0 0 16px; padding: 14px; color: var(--ink); background: white; border: 1px solid rgba(23,23,19,.12); border-left: 4px solid var(--muted); border-radius: 14px; }
+.online-outlook.online { border-left-color: #386a8c; }
+.online-outlook.local { border-left-color: var(--green); }
+.online-outlook.similar { border-left-color: var(--gold); }
+.online-outlook h3 { display: flex; align-items: center; gap: 7px; margin: 0 0 6px; font: 700 15px/1.25 "Space Grotesk",sans-serif; }
+.online-outlook p { margin: 0; color: var(--muted); font-size: 12px; }
+.online-outlook dl { margin: 0; }
+.online-outlook dl div { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 12px; }
+.online-outlook dt { color: var(--muted); }
+.online-outlook dd { margin: 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+.online-outlook .total { border-top: 1px solid rgba(23,23,19,.1); font-weight: 700; }
+.online-outlook .total dt { color: var(--ink); }
+.settings-toggle { display: flex; align-items: flex-start; gap: 10px; margin: 2px 2px 9px; padding: 10px 8px 12px; border-bottom: 1px solid rgba(255,255,255,.09); cursor: pointer; }
+.settings-toggle input { width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--gold); }
+.settings-toggle span { display: grid; gap: 3px; }
+.settings-toggle strong { font-size: 11px; }
+.settings-toggle small { color: rgba(255,255,255,.5); font-size: 10px; line-height: 1.4; }
+@media (max-width: 480px) { .price-breakdown { grid-template-columns: 1fr; } }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 50% { opacity: .55; transform: scale(.82); } }
