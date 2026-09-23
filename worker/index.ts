@@ -1,11 +1,28 @@
 import { Buffer } from "node:buffer";
-import { desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
-import type { AgentRunEvent, AgentRunHistory, AnalysisResponse, Comparable, DetectedItem, HistoryPage, Stats } from "../src/types";
+import type {
+  AgentRunEvent,
+  AgentRunHistory,
+  AnalysisEvent,
+  Comparable,
+  DetectedItem,
+  DeviceDetection,
+  HistoryPage,
+  Stats,
+} from "../src/types";
 import { HISTORY_PAGE_SIZE, HistoryQueryError, historyQuery } from "./history";
-import { AGENT_INSTRUCTIONS, analyzeFrame, buildAgentInputText } from "./agent";
+import {
+  AGENT_INSTRUCTIONS,
+  type AgentRunAudit,
+  buildAgentInputText,
+  identifyFrame,
+  type IdentifiedItem,
+  researchItems,
+} from "./agent";
 import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db/schema";
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
+import { type TriageDecision, type TriageRun, triageItems } from "./triage";
 
 const MAX_FRAME_BYTES = 2_500_000;
 
@@ -19,7 +36,7 @@ class HttpError extends Error {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     try {
@@ -62,7 +79,7 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/api/analyze") {
-        return await analyzeRequest(request, env);
+        return await analyzeRequest(request, env, ctx);
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/api/thumbnails/")) {
@@ -98,7 +115,7 @@ async function createSession(request: Request, env: Env): Promise<Response> {
   return Response.json({ id: body.id, sourceType, sourceName, startedAt }, { status: 201 });
 }
 
-async function analyzeRequest(request: Request, env: Env): Promise<Response> {
+async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (!env.OPENAI_API_KEY || env.OPENAI_API_KEY === "your_openai_api_key_here") {
     throw new HttpError(503, "Add your OpenAI API key to .dev.vars before scanning.");
   }
@@ -123,6 +140,7 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
     throw new HttpError(400, "Find criteria must be text.");
   }
   const findCriteria = (findCriteriaValue ?? "").slice(0, 1000);
+  const deviceDetections = parseDeviceDetections(form.get("deviceDetections"));
 
   const capturedAt =
     typeof capturedAtValue === "string" && !Number.isNaN(Date.parse(capturedAtValue))
@@ -143,241 +161,423 @@ async function analyzeRequest(request: Request, env: Env): Promise<Response> {
     httpMetadata: { contentType: image.type, cacheControl: "private, max-age=31536000, immutable" },
   });
 
-  try {
-    const result = await analyzeFrame({
-      apiKey: env.OPENAI_API_KEY,
-      model: env.OPENAI_MODEL,
-      imageDataUrl,
-      db,
-      sessionId,
-      findCriteria,
-      ebayCredentials:
-        env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
-          ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
-          : undefined,
+  // Items are streamed as NDJSON: quick prices first, then researched prices for items that need them.
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const send = (event: AnalysisEvent) => {
+    writer.write(encoder.encode(`${JSON.stringify(event)}\n`)).catch(() => {
+      // The client went away. Keep going so the frame is still saved and researched.
     });
-    const detectedItems: DetectedItem[] = [];
-    const knownFingerprints = await db
-      .select({ id: items.id, fingerprint: items.fingerprint })
-      .from(items)
-      .orderBy(desc(items.lastSeenAt))
-      .limit(250);
+  };
 
-    for (const candidate of result.analysis.items) {
-      const proposedFingerprint = normalizeFingerprint(candidate.fingerprint || candidate.name);
-      if (!proposedFingerprint) continue;
+  const pipeline = (async () => {
+    let modelCalls = 0;
+    let searchesPerformed = 0;
+    let runRecorded = false;
+    const savedRows = new Map<string, SavedItem>();
+    try {
+      const identified = await identifyFrame({
+        apiKey: env.OPENAI_API_KEY,
+        model: env.OPENAI_MODEL,
+        imageDataUrl,
+        db,
+        sessionId,
+        findCriteria,
+        deviceDetections,
+      });
+      modelCalls += identified.modelCalls;
+      searchesPerformed += identified.searchesPerformed;
 
-      const lunaMatch = candidate.previousMatchId
-        ? knownFingerprints.find((known) => known.id === candidate.previousMatchId)
-        : undefined;
-      const fingerprintFallback = knownFingerprints
-        .map((known) => ({ ...known, score: fingerprintSimilarity(proposedFingerprint, known.fingerprint) }))
-        .filter((known) => known.score >= 0.72)
-        .sort((left, right) => right.score - left.score)[0];
-      const previousMatch = lunaMatch ?? fingerprintFallback;
-      const fingerprint = previousMatch?.fingerprint ?? proposedFingerprint;
+      const triage = await triageItems(identified.output, {
+        apiKey: env.TYPESAFE_API_KEY || undefined,
+        mode: env.PRICING_TRIAGE,
+      });
 
-      const proposedId = crypto.randomUUID();
-      const [saved] = await db
-        .insert(items)
-        .values({
-          id: proposedId,
-          scanSessionId: sessionId,
-          fingerprint,
-          name: candidate.name,
-          category: candidate.category,
-          brand: candidate.brand,
-          model: candidate.model,
-          description: candidate.description,
-          condition: candidate.condition,
-          confidence: candidate.confidence,
-          observedPriceCents: candidate.observedPriceCents,
-          currency: candidate.currency,
-          estimatedLowCents: candidate.estimatedLowCents,
-          estimatedHighCents: candidate.estimatedHighCents,
-          retailPriceCents: candidate.retailPriceCents,
-          activePriceCents: candidate.activePriceCents,
-          soldPriceCents: candidate.soldPriceCents,
-          valueSummary: candidate.valueSummary,
+      const knownFingerprints = await db
+        .select({ id: items.id, fingerprint: items.fingerprint })
+        .from(items)
+        .orderBy(desc(items.lastSeenAt))
+        .limit(250);
+      const frameFingerprints = new Set<string>();
+      for (const [index, candidate] of identified.output.entries()) {
+        const saved = await saveIdentifiedItem(db, {
+          candidate,
+          decision: triage.decisions[index]!,
+          knownFingerprints,
+          frameFingerprints,
+          sessionId,
           thumbnailKey,
-          boxXMin: candidate.boundingBox.xMin,
-          boxYMin: candidate.boundingBox.yMin,
-          boxXMax: candidate.boundingBox.xMax,
-          boxYMax: candidate.boundingBox.yMax,
-          rawJson: JSON.stringify(candidate),
-          firstSeenAt: capturedAt,
-          lastSeenAt: capturedAt,
-          seenCount: 1,
-        })
-        .onConflictDoUpdate({
-          target: items.fingerprint,
-          set: {
-            name: candidate.name,
-            category: candidate.category,
-            brand: candidate.brand,
-            model: candidate.model,
-            description: candidate.description,
-            condition: candidate.condition,
-            confidence: candidate.confidence,
-            observedPriceCents: candidate.observedPriceCents,
-            currency: candidate.currency,
-            estimatedLowCents: candidate.estimatedLowCents,
-            estimatedHighCents: candidate.estimatedHighCents,
-            retailPriceCents: candidate.retailPriceCents,
-            activePriceCents: candidate.activePriceCents,
-            soldPriceCents: candidate.soldPriceCents,
-            valueSummary: candidate.valueSummary,
-            thumbnailKey,
-            boxXMin: candidate.boundingBox.xMin,
-            boxYMin: candidate.boundingBox.yMin,
-            boxXMax: candidate.boundingBox.xMax,
-            boxYMax: candidate.boundingBox.yMax,
-            rawJson: JSON.stringify(candidate),
-            lastSeenAt: capturedAt,
-            seenCount: sql`${items.seenCount} + 1`,
-          },
-        })
-        .returning();
-      if (!saved) throw new Error("D1 did not return the saved item.");
-      const id = saved.id;
-      const firstSeenAt = saved.firstSeenAt;
-      const seenCount = saved.seenCount;
-      const duplicate = proposedId !== id;
-      if (!duplicate) knownFingerprints.push({ id, fingerprint });
-
-      const comparableRows = candidate.comparables.map((comparable) => ({
-        id: crypto.randomUUID(),
-        itemId: id,
-        sourceType: comparable.type,
-        title: comparable.title,
-        url: comparable.url,
-        priceCents: comparable.priceCents,
-        currency: comparable.currency,
-        capturedAt,
-      }));
-      if (comparableRows.length > 0) {
-        await db.insert(valuationSources).values(comparableRows);
+          capturedAt,
+        });
+        if (saved) savedRows.set(saved.row.id, saved);
       }
 
-      detectedItems.push({
-        id,
-        scanSessionId: sessionId,
-        fingerprint,
-        name: candidate.name,
-        category: candidate.category,
-        brand: candidate.brand,
-        model: candidate.model,
-        description: candidate.description,
-        condition: candidate.condition,
-        confidence: candidate.confidence,
-        observedPriceCents: candidate.observedPriceCents,
-        currency: candidate.currency,
-        estimatedLowCents: candidate.estimatedLowCents,
-        estimatedHighCents: candidate.estimatedHighCents,
-        retailPriceCents: candidate.retailPriceCents,
-        activePriceCents: candidate.activePriceCents,
-        soldPriceCents: candidate.soldPriceCents,
-        valueSummary: candidate.valueSummary,
-        thumbnailUrl: `/api/thumbnails/${thumbnailKey}`,
-        boundingBox: candidate.boundingBox,
-        firstSeenAt,
-        lastSeenAt: capturedAt,
-        seenCount,
-        duplicate,
-        comparables: candidate.comparables,
-      });
-    }
+      const identifiedItems = await hydrateItems(env, [...savedRows.values()].map((saved) => saved.row));
+      for (const item of identifiedItems) item.duplicate = savedRows.get(item.id)?.duplicate ?? item.duplicate;
+      send({ type: "items", phase: "identified", frameId, items: identifiedItems });
 
-    if (detectedItems.length === 0) {
-      await env.THUMBNAILS.delete(thumbnailKey);
-    }
+      const toResearch = [...savedRows.values()].filter((saved) => saved.needsResearch);
+      let research: Awaited<ReturnType<typeof researchItems>> | null = null;
+      let researchError: string | null = null;
+      if (toResearch.length > 0) {
+        try {
+          research = await researchItems({
+            apiKey: env.OPENAI_API_KEY,
+            model: env.OPENAI_MODEL,
+            imageDataUrl,
+            items: toResearch.map((saved) => saved.candidate),
+            ebayCredentials:
+              env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
+                ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
+                : undefined,
+          });
+          modelCalls += research.modelCalls;
+          searchesPerformed += research.searchesPerformed;
+        } catch (error) {
+          researchError = error instanceof Error ? error.message : "Research failed";
+          console.error(JSON.stringify({ message: "item research failed", frameId, error: researchError }));
+        }
 
-    const latencyMs = Date.now() - started;
-    const completedAt = new Date().toISOString();
-    if (detectedItems.length === 0) {
-      console.info(
-        JSON.stringify({
+        const researchedAt = new Date().toISOString();
+        const updatedRows: Array<typeof items.$inferSelect> = [];
+        for (const [index, saved] of toResearch.entries()) {
+          const valuation = research?.output.find((candidate) => candidate.index === index);
+          const [updated] = valuation
+            ? await db
+                .update(items)
+                .set({
+                  estimatedLowCents: valuation.estimatedLowCents,
+                  estimatedHighCents: valuation.estimatedHighCents,
+                  retailPriceCents: valuation.retailPriceCents,
+                  activePriceCents: valuation.activePriceCents,
+                  soldPriceCents: valuation.soldPriceCents,
+                  onlineSaleCents: valuation.onlineSaleCents,
+                  shippingCents: valuation.shippingCents,
+                  valueSummary: valuation.valueSummary,
+                  pricingPath: "research",
+                  pricingStatus: "priced",
+                  researchedAt,
+                })
+                .where(eq(items.id, saved.row.id))
+                .returning()
+            : await db
+                .update(items)
+                .set({ pricingStatus: "research_failed" })
+                .where(and(eq(items.id, saved.row.id), eq(items.pricingStatus, "researching")))
+                .returning();
+          if (!updated) continue;
+          updatedRows.push(updated);
+          if (valuation && valuation.comparables.length > 0) {
+            await db.insert(valuationSources).values(valuation.comparables.map((comparable) => ({
+              id: crypto.randomUUID(),
+              itemId: updated.id,
+              sourceType: comparable.type,
+              title: comparable.title,
+              url: comparable.url,
+              priceCents: comparable.priceCents,
+              currency: comparable.currency,
+              capturedAt,
+            })));
+          }
+        }
+        const researchedItems = await hydrateItems(env, updatedRows);
+        for (const item of researchedItems) item.duplicate = savedRows.get(item.id)?.duplicate ?? item.duplicate;
+        send({ type: "items", phase: "researched", frameId, items: researchedItems });
+      }
+
+      if (savedRows.size === 0) {
+        await env.THUMBNAILS.delete(thumbnailKey);
+        console.info(JSON.stringify({
           message: "frame analysis returned no items",
           frameId,
           sessionId,
           capturedAt,
-          latencyMs,
+          latencyMs: Date.now() - started,
           model: env.OPENAI_MODEL,
-          modelCalls: result.modelCalls,
-          searchesPerformed: result.searchesPerformed,
-        }),
-      );
-    }
-    await db.insert(frameRuns).values({
-      id: frameId,
-      scanSessionId: sessionId,
-      thumbnailKey,
-      capturedAt,
-      completedAt,
-      latencyMs,
-      itemCount: detectedItems.length,
-      modelCalls: result.modelCalls,
-      searchesPerformed: result.searchesPerformed,
-      model: env.OPENAI_MODEL,
-      instructions: result.audit.instructions,
-      inputJson: JSON.stringify(result.audit.input),
-      eventsJson: JSON.stringify(result.audit.events),
-      rawResponsesJson: JSON.stringify(result.audit.rawResponses),
-      outputJson: JSON.stringify(result.audit.output),
-      usageJson: JSON.stringify(result.audit.usage),
-      status: "completed",
-      error: null,
-    });
-    await incrementStats(env, {
-      frames: 1,
-      items: detectedItems.length,
-      searches: result.searchesPerformed,
-      modelCalls: result.modelCalls,
-    });
+          modelCalls,
+          searchesPerformed,
+        }));
+      }
 
-    const response: AnalysisResponse = {
-      frameId,
-      items: detectedItems,
-      stats: await getStats(env),
-      run: { latencyMs, modelCalls: result.modelCalls, searchesPerformed: result.searchesPerformed },
-    };
-    return Response.json(response);
-  } catch (error) {
-    const latencyMs = Date.now() - started;
-    const completedAt = new Date().toISOString();
-    const message = error instanceof Error ? error.message : "Frame analysis failed";
-    await Promise.all([
-      db.insert(frameRuns).values({
+      const latencyMs = Date.now() - started;
+      const audit = combineAudits(identified.audit, triage, research?.audit ?? null, researchError);
+      await db.insert(frameRuns).values({
         id: frameId,
         scanSessionId: sessionId,
         thumbnailKey,
         capturedAt,
-        completedAt,
+        completedAt: new Date().toISOString(),
         latencyMs,
-        itemCount: 0,
-        modelCalls: 0,
-        searchesPerformed: 0,
+        itemCount: savedRows.size,
+        modelCalls,
+        searchesPerformed,
         model: env.OPENAI_MODEL,
-        instructions: AGENT_INSTRUCTIONS,
-        inputJson: JSON.stringify({
-          role: "user",
-          content: [
-            { type: "input_text", text: buildAgentInputText(findCriteria) },
-            { type: "input_image", image: "[frame stored in R2]", detail: "high" },
-          ],
-        }),
-        eventsJson: "[]",
-        rawResponsesJson: "[]",
-        outputJson: "null",
-        usageJson: "null",
-        status: "failed",
-        error: message.slice(0, 1000),
-      }),
-      incrementStats(env, { frames: 1, items: 0, searches: 0, modelCalls: 0 }),
-      env.THUMBNAILS.delete(thumbnailKey),
-    ]);
-    throw error;
+        instructions: audit.instructions,
+        inputJson: JSON.stringify(audit.input),
+        eventsJson: JSON.stringify(audit.events),
+        rawResponsesJson: JSON.stringify(audit.rawResponses),
+        outputJson: JSON.stringify(audit.output),
+        usageJson: JSON.stringify(audit.usage),
+        status: "completed",
+        error: researchError,
+      });
+      await incrementStats(env, { frames: 1, items: savedRows.size, searches: searchesPerformed, modelCalls });
+      runRecorded = true;
+
+      send({
+        type: "done",
+        frameId,
+        stats: await getStats(env),
+        run: { latencyMs, modelCalls, searchesPerformed, researchedItems: toResearch.length },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Frame analysis failed";
+      console.error(JSON.stringify({ message: "frame analysis failed", frameId, error: message }));
+      const cleanup: Array<Promise<unknown>> = [];
+      if (savedRows.size > 0) {
+        // Saved finds keep their thumbnail; anything still waiting for research falls back to its quick price.
+        cleanup.push(db
+          .update(items)
+          .set({ pricingStatus: "research_failed" })
+          .where(and(inArray(items.id, [...savedRows.keys()]), eq(items.pricingStatus, "researching"))));
+      } else {
+        cleanup.push(env.THUMBNAILS.delete(thumbnailKey));
+      }
+      if (!runRecorded) {
+        cleanup.push(
+          db.insert(frameRuns).values({
+            id: frameId,
+            scanSessionId: sessionId,
+            thumbnailKey,
+            capturedAt,
+            completedAt: new Date().toISOString(),
+            latencyMs: Date.now() - started,
+            itemCount: savedRows.size,
+            modelCalls,
+            searchesPerformed,
+            model: env.OPENAI_MODEL,
+            instructions: AGENT_INSTRUCTIONS,
+            inputJson: JSON.stringify({
+              role: "user",
+              content: [
+                { type: "input_text", text: buildAgentInputText(findCriteria, deviceDetections) },
+                { type: "input_image", image: "[frame stored in R2]", detail: "high" },
+              ],
+            }),
+            eventsJson: "[]",
+            rawResponsesJson: "[]",
+            outputJson: "null",
+            usageJson: "null",
+            status: "failed",
+            error: message.slice(0, 1000),
+          }),
+          incrementStats(env, { frames: 1, items: savedRows.size, searches: searchesPerformed, modelCalls }),
+        );
+      }
+      await Promise.allSettled(cleanup);
+      send({ type: "error", frameId, error: message });
+    } finally {
+      await writer.close().catch(() => undefined);
+    }
+  })();
+  ctx.waitUntil(pipeline);
+
+  return new Response(readable, {
+    headers: { "content-type": "application/x-ndjson; charset=utf-8", "cache-control": "no-store" },
+  });
+}
+
+type SavedItem = { row: typeof items.$inferSelect; candidate: IdentifiedItem; duplicate: boolean; needsResearch: boolean };
+
+/** A previously researched item is re-used for this long instead of paying for new web searches. */
+const RESEARCH_REUSE_MS = 14 * 24 * 60 * 60 * 1000;
+
+async function saveIdentifiedItem(
+  db: ReturnType<typeof drizzle>,
+  options: {
+    candidate: IdentifiedItem;
+    decision: TriageDecision;
+    knownFingerprints: Array<{ id: string; fingerprint: string }>;
+    /** Fingerprints already saved from this frame; a second candidate for the same object is dropped. */
+    frameFingerprints: Set<string>;
+    sessionId: string;
+    thumbnailKey: string;
+    capturedAt: string;
+  },
+): Promise<SavedItem | null> {
+  const { candidate, decision, knownFingerprints, capturedAt } = options;
+  const proposedFingerprint = normalizeFingerprint(candidate.fingerprint || candidate.name);
+  if (!proposedFingerprint) return null;
+
+  const lunaMatch = candidate.previousMatchId
+    ? knownFingerprints.find((known) => known.id === candidate.previousMatchId)
+    : undefined;
+  const fingerprintFallback = knownFingerprints
+    .map((known) => ({ ...known, score: fingerprintSimilarity(proposedFingerprint, known.fingerprint) }))
+    .filter((known) => known.score >= 0.72)
+    .sort((left, right) => right.score - left.score)[0];
+  const previousMatch = lunaMatch ?? fingerprintFallback;
+  const fingerprint = previousMatch?.fingerprint ?? proposedFingerprint;
+  if (options.frameFingerprints.has(fingerprint)) return null;
+  options.frameFingerprints.add(fingerprint);
+
+  const existing = await db.select().from(items).where(eq(items.fingerprint, fingerprint)).limit(1).then((rows) => rows[0]);
+  const researchAgeMs = existing?.researchedAt ? Date.parse(capturedAt) - Date.parse(existing.researchedAt) : null;
+  // Keep earlier research when it is fresh, when the new triage would only give a quick guess, or
+  // when another frame is researching this item right now.
+  const reuseResearch = Boolean(existing) && (
+    (existing?.pricingStatus === "priced" && researchAgeMs !== null &&
+      (researchAgeMs < RESEARCH_REUSE_MS || decision.path === "instant")) ||
+    (existing?.pricingStatus === "researching" && !isResearchStale(existing.researchStartedAt, capturedAt))
+  );
+
+  const identity = {
+    name: candidate.name,
+    category: candidate.category,
+    brand: candidate.brand,
+    model: candidate.model,
+    description: candidate.description,
+    condition: candidate.condition,
+    confidence: candidate.confidence,
+    observedPriceCents: candidate.observedPriceCents,
+    currency: candidate.currency,
+    thumbnailKey: options.thumbnailKey,
+    boxXMin: candidate.boundingBox.xMin,
+    boxYMin: candidate.boundingBox.yMin,
+    boxXMax: candidate.boundingBox.xMax,
+    boxYMax: candidate.boundingBox.yMax,
+    rawJson: JSON.stringify(candidate),
+    lastSeenAt: capturedAt,
+  };
+  const pricing = reuseResearch && existing
+    ? {
+        estimatedLowCents: existing.estimatedLowCents,
+        estimatedHighCents: existing.estimatedHighCents,
+        retailPriceCents: existing.retailPriceCents,
+        activePriceCents: existing.activePriceCents,
+        soldPriceCents: existing.soldPriceCents,
+        onlineSaleCents: existing.onlineSaleCents,
+        shippingCents: existing.shippingCents,
+        valueSummary: existing.valueSummary,
+        pricingPath: "research" as const,
+        pricingStatus: existing.pricingStatus,
+        triageSource: "reused" as const,
+        triageConfidence: null,
+        researchReason: existing.researchReason,
+        researchedAt: existing.researchedAt,
+        researchStartedAt: existing.researchStartedAt,
+      }
+    : {
+        estimatedLowCents: candidate.quickLowCents,
+        estimatedHighCents: candidate.quickHighCents,
+        retailPriceCents: null,
+        activePriceCents: null,
+        soldPriceCents: null,
+        onlineSaleCents: candidate.onlineSaleCents,
+        shippingCents: candidate.shippingCents,
+        valueSummary: candidate.quickSummary,
+        pricingPath: decision.path,
+        pricingStatus: decision.path === "research" ? ("researching" as const) : ("priced" as const),
+        triageSource: decision.source,
+        triageConfidence: decision.confidence,
+        researchReason: candidate.researchReason,
+        researchedAt: null,
+        researchStartedAt: decision.path === "research" ? capturedAt : null,
+      };
+
+  const proposedId = crypto.randomUUID();
+  const [row] = await db
+    .insert(items)
+    .values({
+      id: proposedId,
+      scanSessionId: options.sessionId,
+      fingerprint,
+      ...identity,
+      ...pricing,
+      firstSeenAt: capturedAt,
+      seenCount: 1,
+    })
+    .onConflictDoUpdate({
+      target: items.fingerprint,
+      set: { ...identity, ...pricing, seenCount: sql`${items.seenCount} + 1` },
+    })
+    .returning();
+  if (!row) throw new Error("D1 did not return the saved item.");
+  const duplicate = proposedId !== row.id;
+  if (!duplicate) knownFingerprints.push({ id: row.id, fingerprint });
+  // A row that another frame is still researching must not be researched again here.
+  return { row, candidate, duplicate, needsResearch: !reuseResearch && row.pricingStatus === "researching" };
+}
+
+/** Research that has not finished after this long was cut off, for example when the Worker stopped. */
+const RESEARCH_TIMEOUT_MS = 10 * 60 * 1000;
+
+function isResearchStale(researchStartedAt: string | null, now: string): boolean {
+  return researchStartedAt === null || Date.parse(now) - Date.parse(researchStartedAt) > RESEARCH_TIMEOUT_MS;
+}
+
+function combineAudits(
+  identify: AgentRunAudit,
+  triage: TriageRun,
+  research: AgentRunAudit | null,
+  researchError: string | null,
+): AgentRunAudit {
+  const events = [
+    ...identify.events.map((event) => ({ ...event, title: `Identify · ${event.title}` })),
+    {
+      sequence: 0,
+      type: "triage",
+      title: `Triage · ${{ jev: "Jev", luna: "Luna hint", config: "Research all", reused: "Reused" }[triage.decisions[0]?.source ?? "luna"]}`,
+      data: triage,
+    },
+    ...(research?.events ?? []).map((event) => ({ ...event, title: `Research · ${event.title}` })),
+    ...(researchError ? [{ sequence: 0, type: "error", title: "Research · Failed", data: { error: researchError } }] : []),
+  ].map((event, sequence) => ({ ...event, sequence }));
+
+  return {
+    instructions: research
+      ? `${identify.instructions}\n\n--- Research stage ---\n\n${research.instructions}`
+      : identify.instructions,
+    input: { identify: identify.input, research: research?.input ?? null },
+    events,
+    rawResponses: [...identify.rawResponses, ...(research?.rawResponses ?? [])],
+    output: { identify: identify.output, triage: triage.decisions, research: research?.output ?? null },
+    usage: { identify: identify.usage, research: research?.usage ?? null },
+  };
+}
+
+function parseDeviceDetections(value: ReturnType<FormData["get"]>): DeviceDetection[] {
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((entry): entry is DeviceDetection =>
+        isRecord(entry) &&
+        typeof entry.label === "string" &&
+        typeof entry.score === "number" &&
+        isRecord(entry.box) &&
+        ["xMin", "yMin", "xMax", "yMax"].every((key) => typeof (entry.box as Record<string, unknown>)[key] === "number"),
+      )
+      .slice(0, 20)
+      .map((entry) => ({
+        label: entry.label.slice(0, 40),
+        score: Math.min(1, Math.max(0, entry.score)),
+        box: {
+          xMin: clampCoordinate(entry.box.xMin),
+          yMin: clampCoordinate(entry.box.yMin),
+          xMax: clampCoordinate(entry.box.xMax),
+          yMax: clampCoordinate(entry.box.yMax),
+        },
+      }));
+  } catch {
+    return [];
   }
+}
+
+function clampCoordinate(value: number): number {
+  return Math.min(1000, Math.max(0, Math.round(value)));
 }
 
 async function getItems(env: Env, params: URLSearchParams): Promise<HistoryPage> {
@@ -536,7 +736,17 @@ async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): P
     retailPriceCents: row.retailPriceCents,
     activePriceCents: row.activePriceCents,
     soldPriceCents: row.soldPriceCents,
+    onlineSaleCents: row.onlineSaleCents,
+    shippingCents: row.shippingCents,
     valueSummary: row.valueSummary,
+    pricingPath: row.pricingPath,
+    pricingStatus:
+      row.pricingStatus === "researching" && isResearchStale(row.researchStartedAt, new Date().toISOString())
+        ? "research_failed"
+        : row.pricingStatus,
+    triageSource: row.triageSource,
+    triageConfidence: row.triageConfidence,
+    researchReason: row.researchReason,
     thumbnailUrl: `/api/thumbnails/${row.thumbnailKey}`,
     boundingBox:
       row.boxXMin === null || row.boxYMin === null || row.boxXMax === null || row.boxYMax === null

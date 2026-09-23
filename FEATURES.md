@@ -4,7 +4,7 @@ This file tracks intentionally deferred product ideas so the MVP can stay focuse
 
 ## Planned
 
-- **Live-feed bounding-box tracking:** Extend the saved-frame bounding boxes into stable, tracked overlays on the moving camera feed.
+- **Live-feed bounding-box tracking:** Match on-device detections to saved finds so their prices follow the object on the moving camera feed.
 - **Natural-language discovery filters:** Let the scanner prompt Luna with filters such as “only show me band T-shirts valued over $50.” Keep capturing activity metrics even when a detected item is filtered from the visible feed.
 - **eBay sold-comps integration:** Add an eBay MCP server or eBay developer API tool when credentials are available. Prefer sold listings and retain links and timestamps for each comparable.
 - **Configurable alert rules:** Filter by category, value, estimated profit, ROI, brand, condition, or confidence.
@@ -26,3 +26,6 @@ This file tracks intentionally deferred product ideas so the MVP can stay focuse
 - No authentication; single local user.
 - Live scale counters: frames processed, items identified, searches performed, and total model calls.
 - Luna returns normalized item coordinates; saved-frame thumbnails and detail views render item-level bounding boxes.
+- Two-stage pricing: quick prices first, web research only for items that need it. Jev (optional) or Luna decides.
+- On-device MediaPipe detection draws live boxes and skips live frames with nothing new in view.
+- The detail sheet shows the pricing path, tag profit and ROI, sold and listed prices, and an online-versus-local verdict.

@@ -30,7 +30,18 @@ export const items = sqliteTable(
     retailPriceCents: integer("retail_price_cents"),
     activePriceCents: integer("active_price_cents"),
     soldPriceCents: integer("sold_price_cents"),
+    onlineSaleCents: integer("online_sale_cents"),
+    shippingCents: integer("shipping_cents"),
     valueSummary: text("value_summary").notNull(),
+    pricingPath: text("pricing_path", { enum: ["instant", "research"] }).notNull().default("research"),
+    pricingStatus: text("pricing_status", { enum: ["priced", "researching", "research_failed"] })
+      .notNull()
+      .default("priced"),
+    triageSource: text("triage_source", { enum: ["jev", "luna", "reused", "config"] }).notNull().default("luna"),
+    triageConfidence: real("triage_confidence"),
+    researchReason: text("research_reason"),
+    researchedAt: text("researched_at"),
+    researchStartedAt: text("research_started_at"),
     thumbnailKey: text("thumbnail_key").notNull(),
     boxXMin: integer("box_x_min"),
     boxYMin: integer("box_y_min"),

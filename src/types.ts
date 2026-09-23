@@ -21,6 +21,10 @@ export type BoundingBox = {
   yMax: number;
 };
 
+export type PricingPath = "instant" | "research";
+export type PricingStatus = "priced" | "researching" | "research_failed";
+export type TriageSource = "jev" | "luna" | "reused" | "config";
+
 export type DetectedItem = {
   id: string;
   scanSessionId: string;
@@ -39,7 +43,14 @@ export type DetectedItem = {
   retailPriceCents: number | null;
   activePriceCents: number | null;
   soldPriceCents: number | null;
+  onlineSaleCents: number | null;
+  shippingCents: number | null;
   valueSummary: string;
+  pricingPath: PricingPath;
+  pricingStatus: PricingStatus;
+  triageSource: TriageSource;
+  triageConfidence: number | null;
+  researchReason: string | null;
   thumbnailUrl: string;
   boundingBox: BoundingBox | null;
   firstSeenAt: string;
@@ -54,16 +65,22 @@ export type HistoryPage = {
   nextCursor: string | null;
 };
 
-export type AnalysisResponse = {
-  frameId: string;
-  items: DetectedItem[];
-  stats: Stats;
-  run: {
-    latencyMs: number;
-    modelCalls: number;
-    searchesPerformed: number;
-  };
+export type DeviceDetection = {
+  label: string;
+  score: number;
+  box: BoundingBox;
 };
+
+/** One line of the NDJSON stream returned by POST /api/analyze. */
+export type AnalysisEvent =
+  | { type: "items"; phase: "identified" | "researched"; frameId: string; items: DetectedItem[] }
+  | {
+      type: "done";
+      frameId: string;
+      stats: Stats;
+      run: { latencyMs: number; modelCalls: number; searchesPerformed: number; researchedItems: number };
+    }
+  | { type: "error"; frameId: string; error: string };
 
 export type AgentRunEvent = {
   sequence: number;

@@ -1,2 +1,6 @@
 # Copy to .dev.vars and replace the placeholder with your OpenAI project key.
 OPENAI_API_KEY=your_openai_api_key_here
+# Optional: TypeSafe Jev key for fast pricing triage. Without it, Luna's own triage hint is used.
+TYPESAFE_API_KEY=
+# Optional: "auto" (default) prices cheap common items instantly; "research_all" researches every item, as before.
+PRICING_TRIAGE=auto
