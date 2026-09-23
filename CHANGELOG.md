@@ -2,7 +2,19 @@
 
 All notable changes to Yard Sale Gold. Dates use ISO 8601.
 
-## [Unreleased] — comps and markets
+## [Unreleased] — local setup
+
+### Added
+
+- `wrangler.local.jsonc`, `npm run setup:local`, and `npm run dev:local`: run the app fully on your machine with local D1 and R2. No Cloudflare account or token is needed.
+
+### Fixed
+
+- The item sheet could start a React render loop ("Maximum update depth exceeded") while its frame query was loading. The default empty list is now one shared array.
+- "Profit at tag" used the local price, but the buy / pass verdict used the best net. Both now use the best net.
+- A platform with no fee shows "—", not "−$0".
+
+## Comps and markets — branch `feature/comps-markets`
 
 ### Added
 

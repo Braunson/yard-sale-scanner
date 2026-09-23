@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { localResaleCents, offerAdvice, onlineSalePrice, saleOutlook, tagMargin } from "./pricing";
+import { localResaleCents, offerAdvice, onlineSalePrice, saleOutlook } from "./pricing";
 
 const base = {
   estimatedLowCents: 2_000,
@@ -69,20 +69,6 @@ describe("saleOutlook", () => {
     const outlook = saleOutlook({ ...base, currency: "CAD", goodsType: "fashion", onlineSaleCents: 1_500 });
     expect(ids(outlook)).toEqual(["local", "poshmark", "ebay"]);
     expect(outlook.options.find((option) => option.platform.id === "poshmark")?.feesCents).toBe(395);
-  });
-});
-
-describe("tagMargin", () => {
-  it("computes profit and ROI against the tag price", () => {
-    expect(tagMargin({ observedPriceCents: 500, estimatedLowCents: 2_000, estimatedHighCents: 3_000 })).toEqual({
-      profitCents: 2_000,
-      roi: 4,
-    });
-  });
-
-  it("handles free items and missing tags", () => {
-    expect(tagMargin({ observedPriceCents: 0, estimatedLowCents: 1_000, estimatedHighCents: 1_000 })?.roi).toBeNull();
-    expect(tagMargin({ observedPriceCents: null, estimatedLowCents: 1_000, estimatedHighCents: 1_000 })).toBeNull();
   });
 });
 

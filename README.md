@@ -16,7 +16,18 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
 
 ## Run locally
 
-1. Copy `.dev.vars.example` to `.dev.vars` and replace the placeholder. Only `OPENAI_API_KEY` is required; see [Configuration](#configuration) for the optional values.
+Local use needs no Cloudflare account. `wrangler.local.jsonc` keeps D1 and R2 in `.wrangler/state` on your machine.
+
+1. Install dependencies and set up the local database:
+
+   ```bash
+   npm install
+   npm run setup:local
+   ```
+
+   `setup:local` creates `.dev.vars` from `.dev.vars.example` (if it does not exist) and applies all D1 migrations to the local database.
+
+2. Put your OpenAI key in `.dev.vars`. Only `OPENAI_API_KEY` is required; see [Configuration](#configuration) for the optional values.
 
    ```dotenv
    OPENAI_API_KEY=your_real_project_key
@@ -28,20 +39,17 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
    DISCOGS_TOKEN=
    ```
 
-2. The checked-in `wrangler.jsonc` targets the author's Cloudflare resources and uses remote D1/R2 bindings. For local development, remove `remote: true` from both bindings. Install dependencies and apply local D1 migrations:
-
-   ```bash
-   npm install
-   npm run db:migrate:local
-   ```
-
 3. Start the app:
 
    ```bash
-   npm run dev
+   npm run dev:local
    ```
 
-4. Open `http://127.0.0.1:5173`. Select a camera for live scanning or snapshots, or upload a photo/video. You can keep your own garage-sale clips in the ignored local `yard-sale-footage/` folder; footage is not included in this repository.
+4. Open `http://localhost:5173` (Vite picks the next free port if 5173 is in use). Select a camera for live scanning or snapshots, or upload a photo/video. You can keep your own garage-sale clips in the ignored local `yard-sale-footage/` folder; footage is not included in this repository.
+
+Browsers allow the camera only on `localhost` or HTTPS. To scan with a phone on your network, you need HTTPS, for example with a tunnel.
+
+`npm run dev` still uses `wrangler.jsonc`, which targets the original author's Cloudflare resources with remote D1 and R2 bindings. Use it only with your own resources in that file.
 
 The browser samples compressed frames at a configurable 1–30 second interval and allows up to 100 analyses in flight. Frame images are not bundled with the app.
 
@@ -96,7 +104,9 @@ npm test                 # deterministic unit tests (no Cloudflare credentials n
 npm run build            # type-check and production build
 npm run cf-typegen       # regenerate Worker binding types
 npm run db:generate      # generate a migration after schema changes
-npm run db:migrate:local # apply migrations to local D1
+npm run setup:local      # create .dev.vars and apply migrations to local D1
+npm run dev:local        # run fully on this machine (wrangler.local.jsonc)
+npm run db:migrate:local # apply new migrations to local D1
 ```
 
 GitHub Actions runs `npm test` and `npm run build` on every pull request and on pushes to `main` (`.github/workflows/ci.yml`). Neither step needs secrets.

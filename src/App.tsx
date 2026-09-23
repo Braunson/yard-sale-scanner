@@ -30,7 +30,7 @@ import { loadBarcodeReader, readBarcodes } from "./barcodes";
 import { MARKETS } from "./markets";
 import { mergeTracks, seedTracks, type Track, TRACK_MAX_SEED_DELAY_MS, updateTracks } from "./tracking";
 import { compStats, MIN_MATCH_SCORE, type PriceStats } from "./comps";
-import { DEFAULT_OFFER_TARGETS, localResaleCents, offerAdvice, type OfferTargets, saleOutlook, tagMargin } from "./pricing";
+import { DEFAULT_OFFER_TARGETS, localResaleCents, offerAdvice, type OfferTargets, saleOutlook } from "./pricing";
 import type {
   AgentRunHistory,
   AnalysisEvent,
@@ -76,6 +76,8 @@ type Source = "camera" | "video" | "image";
 type DetectorStatus = "off" | "loading" | "ready" | "failed";
 
 const OfferTargetsContext = createContext<OfferTargets>(DEFAULT_OFFER_TARGETS);
+/** One shared empty list, so an effect that depends on a loading query does not run on every render. */
+const NO_ITEMS: DetectedItem[] = [];
 
 async function readAnalysisStream(body: ReadableStream<Uint8Array>, onEvent: (event: AnalysisEvent) => void) {
   const reader = body.getReader();
@@ -256,7 +258,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
     [...new Map(savedFinds.data?.pages.flatMap((page) => page.items).map((item) => [item.id, item]) ?? []).values()],
   [savedFinds.data]);
   const searchPending = historySearch.trim() !== debouncedSearch;
-  const { data: routedFrameItems = [] } = useQuery({
+  const { data: routedFrameItems = NO_ITEMS } = useQuery({
     queryKey: ["frame-items", itemId],
     queryFn: () => fetchFrameItems(itemId!),
     enabled: Boolean(itemId),
@@ -1928,7 +1930,15 @@ function PricingPathPanel({ item }: { item: DetectedItem }) {
 }
 
 function PriceBreakdown({ item }: { item: DetectedItem }) {
-  const margin = tagMargin(item);
+  // Profit uses the best way to sell, the same net as the buy / pass verdict.
+  const bestNet = saleOutlook(item).best?.netCents ?? null;
+  const margin =
+    item.observedPriceCents === null || bestNet === null
+      ? null
+      : {
+          profitCents: bestNet - item.observedPriceCents,
+          roi: item.observedPriceCents > 0 ? (bestNet - item.observedPriceCents) / item.observedPriceCents : null,
+        };
   const rows: Array<{ label: string; value: string; tone?: "good" | "bad" }> = [];
   if (item.observedPriceCents !== null) rows.push({ label: "Tag price", value: money(item.observedPriceCents, item.currency) });
   if (margin) {
@@ -1994,7 +2004,7 @@ function SaleOptionsPanel({ item }: { item: DetectedItem }) {
             <tr key={option.platform.id} className={option === outlook.best ? "best" : undefined} title={option.platform.feeSummary}>
               <td>{option.platform.name}</td>
               <td>{money(option.saleCents, item.currency)}</td>
-              <td>−{money(option.feesCents, item.currency)}</td>
+              <td>{option.feesCents === 0 ? "—" : `−${money(option.feesCents, item.currency)}`}</td>
               <td>{option.shippingCents === null ? "?" : option.shippingCents === 0 ? "—" : `−${money(option.shippingCents, item.currency)}`}</td>
               <td>{option.netCents === null ? "?" : money(option.netCents, item.currency)}</td>
             </tr>
