@@ -9,7 +9,8 @@ export default defineConfig({
   },
   plugins: [
     react(),
-    cloudflare(),
+    // `npm run dev:local` selects wrangler.local.jsonc, which keeps D1 and R2 on this machine.
+    cloudflare({ configPath: process.env.WRANGLER_CONFIG ?? "./wrangler.jsonc" }),
     VitePWA({
       registerType: "autoUpdate",
       manifest: {

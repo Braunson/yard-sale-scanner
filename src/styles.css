@@ -380,3 +380,35 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .settings-select { width: 100%; padding: 9px 10px; color: white; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.13); border-radius: 12px; }
 .settings-hint { display: block; margin-top: 6px; color: rgba(255,255,255,.5); font-size: 10px; line-height: 1.4; }
 @media (max-width: 480px) { .platform-table th:nth-child(2), .platform-table td:nth-child(2) { display: none; } }
+
+.history-tabs { display: flex; gap: 6px; margin: 0 0 12px; }
+.history-tabs a { padding: 7px 14px; color: rgba(255,255,255,.65); background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); border-radius: 999px; font-size: 12px; font-weight: 700; text-decoration: none; }
+.history-tabs a.active { color: var(--ink); background: var(--gold); border-color: var(--gold); }
+.ledger-badge { display: inline-flex; flex: 0 0 auto; padding: 2px 5px; border-radius: 4px; font-size: 8px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.ledger-badge.bought { color: white; background: #635bac; }
+.ledger-badge.sold { color: white; background: #1f7a4d; }
+.ledger-panel { display: grid; gap: 10px; margin: 0 0 16px; padding: 14px; color: var(--ink); background: white; border: 1px solid rgba(23,23,19,.12); border-radius: 14px; }
+.ledger-panel h3 { display: flex; align-items: center; gap: 7px; margin: 0; font: 700 15px "Space Grotesk",sans-serif; }
+.ledger-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px 10px; }
+.ledger-grid label { display: grid; gap: 4px; min-width: 0; }
+.ledger-grid label.wide { grid-column: 1 / -1; }
+.ledger-grid span { color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.ledger-grid input, .ledger-grid select { width: 100%; min-width: 0; padding: 8px 10px; color: var(--ink); background: #f6f4ee; border: 1px solid rgba(23,23,19,.14); border-radius: 10px; font-size: 14px; }
+.ledger-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; }
+.ledger-actions button { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; color: white; background: var(--green); border: 0; border-radius: 10px; font-weight: 700; cursor: pointer; }
+.ledger-actions button:disabled { opacity: .6; }
+.ledger-actions .good, .ledger-totals .good { color: var(--green); font-weight: 700; }
+.ledger-actions .bad, .ledger-totals .bad { color: #9c3328; font-weight: 700; }
+.ledger-panel small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.ledger-error { margin: 0; color: #9c3328; font-size: 12px; }
+.ledger-screen { display: grid; gap: 14px; }
+.ledger-totals { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; margin: 0; padding: 14px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); border-radius: 14px; }
+.ledger-totals dt { color: rgba(255,255,255,.55); font-size: 10px; text-transform: uppercase; }
+.ledger-totals dd { margin: 3px 0 0; font: 700 16px "Space Grotesk",sans-serif; }
+.ledger-totals .good { color: #6fd3a0; }
+.ledger-totals .bad { color: #ff9b8f; }
+.accuracy-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.accuracy-table caption { margin-bottom: 6px; color: rgba(255,255,255,.7); font-weight: 700; text-align: left; }
+.accuracy-table th { padding: 4px; color: rgba(255,255,255,.5); font-size: 10px; text-align: right; text-transform: uppercase; }
+.accuracy-table td { padding: 6px 4px; text-align: right; border-top: 1px solid rgba(255,255,255,.08); }
+.accuracy-table th:first-child, .accuracy-table td:first-child { text-align: left; }

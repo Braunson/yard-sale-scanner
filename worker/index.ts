@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/d1";
 import type {
   AgentRunEvent,
@@ -29,6 +29,7 @@ import { isResearchStale, keepsExistingPricing } from "./research";
 import { deviceBarcodeForItem, isValidBarcode, lookupBarcode } from "./comps/identity";
 import { finalizeComps, MAX_COMPS_PER_ITEM, pricesFromStats, specialistComps } from "./comps/pipeline";
 import { MARKET_CONFIG } from "./comps/types";
+import { buildLedger, LedgerInputError } from "./ledger";
 
 const MAX_FRAME_BYTES = 2_500_000;
 
@@ -56,6 +57,16 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/items") {
         return Response.json(await getItems(env, url.searchParams));
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/ledger") {
+        return Response.json(await getLedgerItems(env));
+      }
+
+      if (request.method === "PUT" && url.pathname.startsWith("/api/items/") && url.pathname.endsWith("/ledger")) {
+        const itemId = decodeURIComponent(url.pathname.slice("/api/items/".length, -"/ledger".length));
+        if (!itemId || itemId.includes("/")) throw new HttpError(400, "Invalid item id.");
+        return Response.json(await saveLedger(request, env, itemId));
       }
 
       if (request.method === "DELETE" && url.pathname === "/api/items") {
@@ -94,7 +105,12 @@ export default {
 
       return Response.json({ error: "Not found" }, { status: 404 });
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : error instanceof HistoryQueryError ? 400 : 500;
+      const status =
+        error instanceof HttpError
+          ? error.status
+          : error instanceof HistoryQueryError || error instanceof LedgerInputError
+            ? 400
+            : 500;
       const message = error instanceof Error ? error.message : "Unexpected error";
       console.error(JSON.stringify({ message: "request failed", path: url.pathname, status, error: message }));
       return Response.json({ error: message }, { status });
@@ -740,6 +756,41 @@ async function deleteThumbnailKeys(env: Env, keys: string[]): Promise<void> {
   }
 }
 
+async function saveLedger(request: Request, env: Env, itemId: string): Promise<DetectedItem> {
+  const db = drizzle(env.DB);
+  const row = await db.select().from(items).where(eq(items.id, itemId)).limit(1).then((rows) => rows[0]);
+  if (!row) throw new HttpError(404, "Find not found.");
+  const [item] = await hydrateItems(env, [row]);
+  const ledger = buildLedger(await request.json<unknown>(), item!);
+  const [updated] = await db
+    .update(items)
+    .set({
+      ledgerPurchaseCents: ledger.purchaseCents,
+      ledgerPurchasedAt: ledger.purchasedAt,
+      ledgerSaleCents: ledger.saleCents,
+      ledgerSoldAt: ledger.soldAt,
+      ledgerPlatformId: ledger.platformId,
+      ledgerFeesCents: ledger.feesCents,
+      ledgerShippingCents: ledger.shippingCents,
+      ledgerEstimateCents: ledger.estimateCents,
+    })
+    .where(eq(items.id, itemId))
+    .returning();
+  const [saved] = await hydrateItems(env, [updated!]);
+  return saved!;
+}
+
+/** Every find with a recorded purchase or sale, newest activity first. */
+async function getLedgerItems(env: Env): Promise<DetectedItem[]> {
+  const db = drizzle(env.DB);
+  const rows = await db
+    .select()
+    .from(items)
+    .where(or(isNotNull(items.ledgerPurchaseCents), isNotNull(items.ledgerSaleCents)))
+    .orderBy(desc(sql`coalesce(${items.ledgerSoldAt}, ${items.ledgerPurchasedAt})`));
+  return hydrateItems(env, rows);
+}
+
 async function getFrameItems(env: Env, itemId: string): Promise<DetectedItem[]> {
   const db = drizzle(env.DB);
   const selected = await db.select().from(items).where(eq(items.id, itemId)).limit(1).then((rows) => rows[0]);
@@ -798,14 +849,15 @@ async function getAgentRunForItem(env: Env, itemId: string): Promise<AgentRunHis
 async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): Promise<DetectedItem[]> {
   const db = drizzle(env.DB);
   const ids = rows.map((row) => row.id);
-  const sources =
-    ids.length === 0
-      ? []
-      : await db
-          .select()
-          .from(valuationSources)
-          .where(inArray(valuationSources.itemId, ids))
-          .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 0)`));
+  // D1 allows 100 bound parameters per statement, so large lists (the ledger) are read in chunks.
+  const sources: Array<typeof valuationSources.$inferSelect> = [];
+  for (let start = 0; start < ids.length; start += 90) {
+    sources.push(...await db
+      .select()
+      .from(valuationSources)
+      .where(inArray(valuationSources.itemId, ids.slice(start, start + 90)))
+      .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 0)`)));
+  }
   const sourceMap = new Map<string, Comparable[]>();
   for (const source of sources) {
     const comparables = sourceMap.get(source.itemId) ?? [];
@@ -870,6 +922,19 @@ async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): P
     seenCount: row.seenCount,
     duplicate: row.seenCount > 1,
     comparables: sourceMap.get(row.id) ?? [],
+    ledger:
+      row.ledgerPurchaseCents === null && row.ledgerSaleCents === null
+        ? null
+        : {
+            purchaseCents: row.ledgerPurchaseCents,
+            purchasedAt: row.ledgerPurchasedAt,
+            saleCents: row.ledgerSaleCents,
+            soldAt: row.ledgerSoldAt,
+            platformId: row.ledgerPlatformId,
+            feesCents: row.ledgerFeesCents,
+            shippingCents: row.ledgerShippingCents,
+            estimateCents: row.ledgerEstimateCents,
+          },
   }));
 }
 

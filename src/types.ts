@@ -38,6 +38,20 @@ export type PricingPath = "instant" | "research";
 export type PricingStatus = "priced" | "researching" | "research_failed";
 export type TriageSource = "jev" | "luna" | "reused" | "config";
 
+/** What you really paid and got for a find. All amounts are in the find's currency. */
+export type Ledger = {
+  purchaseCents: number | null;
+  purchasedAt: string | null;
+  saleCents: number | null;
+  soldAt: string | null;
+  /** A platform id from src/markets.ts, for example "ebay" or "local". */
+  platformId: string | null;
+  feesCents: number | null;
+  shippingCents: number | null;
+  /** The app's expected sale price on that platform when the sale was recorded, for accuracy checks. */
+  estimateCents: number | null;
+};
+
 export type DetectedItem = {
   id: string;
   scanSessionId: string;
@@ -76,6 +90,7 @@ export type DetectedItem = {
   seenCount: number;
   duplicate: boolean;
   comparables: Comparable[];
+  ledger: Ledger | null;
 };
 
 export type HistoryPage = {

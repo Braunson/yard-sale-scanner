@@ -16,7 +16,18 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
 
 ## Run locally
 
-1. Copy `.dev.vars.example` to `.dev.vars` and replace the placeholder. Only `OPENAI_API_KEY` is required; see [Configuration](#configuration) for the optional values.
+Local use needs no Cloudflare account. `wrangler.local.jsonc` keeps D1 and R2 in `.wrangler/state` on your machine.
+
+1. Install dependencies and set up the local database:
+
+   ```bash
+   npm install
+   npm run setup:local
+   ```
+
+   `setup:local` creates `.dev.vars` from `.dev.vars.example` (if it does not exist) and applies all D1 migrations to the local database.
+
+2. Put your OpenAI key in `.dev.vars`. Only `OPENAI_API_KEY` is required; see [Configuration](#configuration) for the optional values.
 
    ```dotenv
    OPENAI_API_KEY=your_real_project_key
@@ -28,20 +39,17 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
    DISCOGS_TOKEN=
    ```
 
-2. The checked-in `wrangler.jsonc` targets the author's Cloudflare resources and uses remote D1/R2 bindings. For local development, remove `remote: true` from both bindings. Install dependencies and apply local D1 migrations:
-
-   ```bash
-   npm install
-   npm run db:migrate:local
-   ```
-
 3. Start the app:
 
    ```bash
-   npm run dev
+   npm run dev:local
    ```
 
-4. Open `http://127.0.0.1:5173`. Select a camera for live scanning or snapshots, or upload a photo/video. You can keep your own garage-sale clips in the ignored local `yard-sale-footage/` folder; footage is not included in this repository.
+4. Open `http://localhost:5173` (Vite picks the next free port if 5173 is in use). Select a camera for live scanning or snapshots, or upload a photo/video. You can keep your own garage-sale clips in the ignored local `yard-sale-footage/` folder; footage is not included in this repository.
+
+Browsers allow the camera only on `localhost` or HTTPS. To scan with a phone on your network, you need HTTPS, for example with a tunnel.
+
+`npm run dev` still uses `wrangler.jsonc`, which targets the original author's Cloudflare resources with remote D1 and R2 bindings. Use it only with your own resources in that file.
 
 The browser samples compressed frames at a configurable 1–30 second interval and allows up to 100 analyses in flight. Frame images are not bundled with the app.
 
@@ -74,7 +82,7 @@ Two-stage pricing is still on without Jev. Luna can mark a generic, low-value it
 
 ## Upgrading from the single-stage version
 
-- **Apply migrations `0004_two_stage_pricing.sql` and `0005_comps_and_markets.sql`** (`npm run db:migrate:local` or `npm run db:migrate:remote`) before you deploy the new Worker. The migration adds pricing columns to `items`. It also marks existing items as researched, so a new scan does not replace their prices.
+- **Apply migrations `0004_two_stage_pricing.sql`, `0005_comps_and_markets.sql`, and `0006_ledger.sql`** (`npm run db:migrate:local` or `npm run db:migrate:remote`) before you deploy the new Worker. The migration adds pricing columns to `items`. It also marks existing items as researched, so a new scan does not replace their prices.
 - **`POST /api/analyze` now returns NDJSON** (`application/x-ndjson`), not one JSON object. See [Analyze stream](#analyze-stream). Scripts that call this endpoint must change.
 - **`npm run cf-typegen` reads `.dev.vars`.** Keep `TYPESAFE_API_KEY` and `PRICING_TRIAGE` in `.dev.vars`, even with empty values. If you do not, the regenerated `worker-configuration.d.ts` does not have them and the Worker does not compile.
 - **Local dev uses HTTP/1.1.** A browser opens only 6 connections to one origin. Research streams stay open after their concurrency slot is released. If you scan fast on `wrangler dev`, new requests can wait. Production on HTTP/2 does not have this problem.
@@ -96,7 +104,9 @@ npm test                 # deterministic unit tests (no Cloudflare credentials n
 npm run build            # type-check and production build
 npm run cf-typegen       # regenerate Worker binding types
 npm run db:generate      # generate a migration after schema changes
-npm run db:migrate:local # apply migrations to local D1
+npm run setup:local      # create .dev.vars and apply migrations to local D1
+npm run dev:local        # run fully on this machine (wrangler.local.jsonc)
+npm run db:migrate:local # apply new migrations to local D1
 ```
 
 GitHub Actions runs `npm test` and `npm run build` on every pull request and on pushes to `main` (`.github/workflows/ci.yml`). Neither step needs secrets.
@@ -182,6 +192,16 @@ Fee schedules are in `src/markets.ts`. Platforms change their fees, so check the
 The **buy / negotiate / pass** verdict uses the best net. The profit target is a number in the item's own currency: $10 means US$10 for a USD find and C$10 for a CAD find. The maximum offer is the lower of "net minus minimum profit" and "net ÷ (1 + minimum ROI)", rounded down to a whole dollar. A tag up to 35% over the maximum gives "negotiate", because yard-sale sellers often take less. Without a tag, the sheet shows only the maximum offer.
 
 The UI reports cumulative frames processed, items identified, searches performed, underlying model calls, frames skipped on the device, and frames still in research. See [FEATURES.md](./FEATURES.md) for live-feed tracking, natural-language filters, eBay integration, and batch processing.
+
+## Ledger
+
+Open a find and use **My purchase and sale** to record what you paid and, later, what it sold for, on which platform, with fees and the shipping you paid. An empty fee uses the platform's standard fee from `src/markets.ts`. Amounts are in the find's currency. To remove an entry, clear both prices and save.
+
+When you record a sale, the app also saves its own estimate for that platform at that moment: the local price for a local sale, else the online sale price. Later re-pricing does not change it.
+
+**History → Ledger** shows, for each currency: profit on sold items, ROI on sold items, the number bought and sold, money spent, revenue, and the cost of unsold stock. It also has an accuracy table. For each group (all sales, instant or researched pricing, goods type, local or online), the table gives the typical miss (the median of |sale − estimate| ÷ estimate) and the bias (the median of (sale − estimate) ÷ estimate; negative means the app estimated too high). After enough sales, use it to tune the research triage and your offer targets.
+
+API: `PUT /api/items/:id/ledger` with `{ purchaseCents, purchasedAt?, saleCents, soldAt?, platformId, feesCents?, shippingCents? }`, and `GET /api/ledger` for every find with a purchase or sale.
 
 ## Cloud deployment
 

@@ -89,17 +89,6 @@ export function localResaleCents(item: Pick<DetectedItem, "estimatedLowCents" | 
   return Math.round(((low ?? high ?? 0) + (high ?? low ?? 0)) / 2);
 }
 
-/** Expected profit from buying at the tag price and reselling at the local midpoint. */
-export function tagMargin(item: Pick<DetectedItem, "observedPriceCents" | "estimatedLowCents" | "estimatedHighCents">) {
-  const localCents = localResaleCents(item);
-  if (item.observedPriceCents === null || localCents === null) return null;
-  const profitCents = localCents - item.observedPriceCents;
-  return {
-    profitCents,
-    roi: item.observedPriceCents > 0 ? profitCents / item.observedPriceCents : null,
-  };
-}
-
 export type OfferTargets = {
   /** Smallest profit worth the trouble of reselling. */
   minProfitCents: number;

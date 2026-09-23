@@ -31,11 +31,17 @@ const historyRoute = createRoute({
   component: () => null,
 });
 
+const ledgerRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/ledger",
+  component: () => null,
+});
+
 const findRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/finds/$itemId",
   validateSearch: (search: Record<string, unknown>) => ({
-    from: search.from === "scan" ? ("scan" as const) : ("history" as const),
+    from: search.from === "scan" ? ("scan" as const) : search.from === "ledger" ? ("ledger" as const) : ("history" as const),
   }),
   component: () => null,
 });
@@ -44,12 +50,12 @@ const findActivityRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/finds/$itemId/activity",
   validateSearch: (search: Record<string, unknown>) => ({
-    from: search.from === "scan" ? ("scan" as const) : ("history" as const),
+    from: search.from === "scan" ? ("scan" as const) : search.from === "ledger" ? ("ledger" as const) : ("history" as const),
   }),
   component: () => null,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, scanRoute, historyRoute, findRoute, findActivityRoute]);
+const routeTree = rootRoute.addChildren([indexRoute, scanRoute, historyRoute, ledgerRoute, findRoute, findActivityRoute]);
 
 export const router = createRouter({ routeTree, scrollRestoration: true });
 
