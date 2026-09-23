@@ -10,6 +10,8 @@ interface __BaseEnv_Env {
 	EBAY_CLIENT_SECRET: string;
 	TYPESAFE_API_KEY: string;
 	PRICING_TRIAGE: string;
+	PRICECHARTING_TOKEN: string;
+	DISCOGS_TOKEN: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
@@ -22,7 +24,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "OPENAI_MODEL" | "OPENAI_API_KEY" | "EBAY_CLIENT_ID" | "EBAY_CLIENT_SECRET" | "TYPESAFE_API_KEY" | "PRICING_TRIAGE">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "OPENAI_MODEL" | "OPENAI_API_KEY" | "EBAY_CLIENT_ID" | "EBAY_CLIENT_SECRET" | "TYPESAFE_API_KEY" | "PRICING_TRIAGE" | "PRICECHARTING_TOKEN" | "DISCOGS_TOKEN">> {}
 }
 
 // Begin runtime types

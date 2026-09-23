@@ -3,9 +3,15 @@ import { desc } from "drizzle-orm";
 import type { DrizzleD1Database } from "drizzle-orm/d1";
 import { z } from "zod";
 import { items } from "./db/schema";
-import { createEbayTools, type EbayCredentials } from "./ebay";
+import { type EbayCredentials, searchEbayActive } from "./comps/ebay";
 import { fingerprintSimilarity } from "./normalize";
-import type { DeviceDetection } from "../src/types";
+import type { Comparable, DeviceBarcode, DeviceDetection, Market } from "../src/types";
+import type { BarcodeIdentity } from "./comps/identity";
+
+const MARKET_PROMPT: Record<Market, { currency: string; region: string; carrier: string }> = {
+  US: { currency: "USD", region: "the United States", carrier: "USPS Ground Advantage" },
+  CA: { currency: "CAD", region: "Canada", carrier: "Canada Post" },
+};
 
 const comparableSchema = z.object({
   title: z.string(),
@@ -38,6 +44,11 @@ const identifiedItemSchema = z.object({
   ),
   observedPriceCents: moneySchema,
   currency: z.string(),
+  goodsType: z
+    .enum(["fashion", "media", "electronics", "collectible", "home", "tools", "toys", "other"])
+    .describe("fashion: clothing, shoes, bags, accessories. media: books, records, CDs, DVDs, games. collectible: cards, figures, coins, memorabilia."),
+  vintage: z.boolean().describe("True only when the item is clearly at least 20 years old."),
+  barcode: z.string().nullable().describe("A barcode from the message that belongs to this item, or null."),
   quickLowCents: moneySchema.describe("Low end of a conservative local resale estimate from general knowledge alone."),
   quickHighCents: moneySchema.describe("High end of a conservative local resale estimate from general knowledge alone."),
   onlineSaleCents: moneySchema.describe("Typical completed online sale price, before fees and shipping, if known."),
@@ -92,8 +103,20 @@ type StageResult<T> = { output: T; modelCalls: number; searchesPerformed: number
 
 export const AGENT_INPUT_TEXT = "Analyze this frame. Return only clearly identifiable items that are likely being offered for sale, with a quick price for each.";
 
-export function buildAgentInputText(findCriteria: string, deviceDetections: DeviceDetection[] = []): string {
-  let text = AGENT_INPUT_TEXT;
+export function buildAgentInputText(
+  findCriteria: string,
+  deviceDetections: DeviceDetection[] = [],
+  market: Market = "US",
+  barcodes: DeviceBarcode[] = [],
+): string {
+  const { currency, region, carrier } = MARKET_PROMPT[market];
+  let text = `${AGENT_INPUT_TEXT}\n\nThe reseller is in ${region}. Give every price in ${currency} for that market, and estimate shipping as a ${carrier} domestic label.`;
+  if (barcodes.length > 0) {
+    const codes = barcodes
+      .map((barcode) => `- ${barcode.value}${barcode.box ? ` at [${barcode.box.xMin}, ${barcode.box.yMin}, ${barcode.box.xMax}, ${barcode.box.yMax}]` : ""}`)
+      .join("\n");
+    text += `\n\nThe device read these retail barcodes (UPC, EAN, or ISBN) in the frame. Set an item's barcode only when the code's position is on that item or the item is the only one it can belong to:\n${codes}`;
+  }
   if (deviceDetections.length > 0) {
     const hints = deviceDetections
       .map((detection) => {
@@ -133,20 +156,24 @@ Apply these inclusion rules before calling tools. Do not invent details hidden b
 4. Give a conservative quick local resale range from general knowledge, and, when you know them, a typical completed online sale price and typical seller-paid shipping. Use null when you would be guessing.
 5. Set pricingHint to "instant" only for generic, common, low-value goods whose second-hand price is well known and where a wrong guess costs little. Set it to "research" for specific brands or models, collectibles, vintage, designer, electronics, tools, anything that may be worth $50 or more, or anything whose tag price looks far below its likely value. Explain the choice in researchReason.
 
-Return integer prices in cents. Return an empty items array when no object passes every inclusion rule. Currency defaults to USD unless a visible tag or source clearly indicates otherwise.`;
+6. Set goodsType, and set vintage only when the style, materials, or markings clearly show the item is at least 20 years old.
+
+Return integer prices in cents. Return an empty items array when no object passes every inclusion rule. Use the currency that the user message gives for the market.`;
 
 export const RESEARCH_INSTRUCTIONS = `You value second-hand items that were already identified in a thrift-store or garage-sale frame. The user message lists each item with an index, its identity, visible condition, and bounding box in the attached frame (normalized 0-1000 coordinates).
 
+The user message gives the reseller's market and currency. Give every price in that currency; convert foreign prices at a current rate.
+
 For every listed item, return one valuation with the same index:
 1. Research the open web and eBay in parallel when the identity is specific enough. For web search, prioritize the manufacturer, major stores, and specialist retailers to confirm the product identity and establish the primary current retail-price baseline. Also seek credible recent sold evidence when available.
-2. Use search_ebay_active_listings concurrently as secondary market evidence when it is available. Do not wait for web research to finish before starting the eBay search, but do not use eBay as the primary retail-price baseline. An active eBay asking price is never a completed sale.
+2. Use search_ebay_active_listings concurrently as secondary market evidence when it is available. Pass the item's index so the listings are recorded as comps for that item. The code scores each listing against the item and computes medians, so give a precise query and do not copy every listing into comparables. Do not wait for web research to finish before starting the eBay search, but do not use eBay as the primary retail-price baseline. An active eBay asking price is never a completed sale.
 3. Set retailPriceCents to the current new-retail price when supported by manufacturer or store evidence. If the exact product is discontinued, estimate its current equivalent replacement value from closely comparable retail products. Use null only when there is not enough evidence for a defensible retail estimate.
 4. Set onlineSaleCents to a typical completed online sale price for an item in this condition, preferring sold evidence and discounting active asking prices. Set shippingCents to a typical seller-paid domestic shipping cost for its size and weight.
 5. Estimate a conservative local resale range (estimatedLowCents to estimatedHighCents) that reflects the visible condition and uncertainty. This is what the item would fetch at a garage sale, flea market, or local marketplace listing.
 6. Return integer prices in cents. Use null when evidence is insufficient. Include concise source titles and URLs in comparables. eBay comparables must be type "active".
 7. Write a short valueSummary that explains the evidence and any uncertainty.
 
-Currency defaults to USD unless a visible tag or source clearly indicates otherwise.`;
+When an item has a barcode identity, trust it for the exact title, edition, and author or brand.`;
 
 export async function identifyFrame(options: {
   apiKey: string;
@@ -156,8 +183,10 @@ export async function identifyFrame(options: {
   sessionId: string;
   findCriteria: string;
   deviceDetections: DeviceDetection[];
+  market: Market;
+  barcodes: DeviceBarcode[];
 }): Promise<StageResult<IdentifiedItem[]>> {
-  const inputText = buildAgentInputText(options.findCriteria, options.deviceDetections);
+  const inputText = buildAgentInputText(options.findCriteria, options.deviceDetections, options.market, options.barcodes);
   const checkPreviousScans = tool({
     name: "check_previous_scans",
     description:
@@ -242,7 +271,11 @@ export async function researchItems(options: {
   model: string;
   imageDataUrl: string;
   items: IdentifiedItem[];
+  market: Market;
+  barcodeIdentities: BarcodeIdentity[];
   ebayCredentials?: EbayCredentials;
+  /** Receives every comp a tool finds, keyed by the item's index in `items`. */
+  onComps: (index: number, comps: Comparable[]) => void;
 }): Promise<StageResult<Valuation[]>> {
   const request = options.items.map((item, index) => ({
     index,
@@ -256,8 +289,37 @@ export async function researchItems(options: {
     tagPriceCents: item.observedPriceCents,
     currency: item.currency,
     whyResearch: item.researchReason,
+    barcode: item.barcode,
+    barcodeIdentity: options.barcodeIdentities.find((identity) => identity.barcode === item.barcode && identity.title) ?? null,
   }));
-  const inputText = `Value these items from the attached frame:\n${JSON.stringify(request, null, 2)}`;
+  const { currency, region, carrier } = MARKET_PROMPT[options.market];
+  const inputText = `The reseller is in ${region}. Give prices in ${currency} and shipping as a ${carrier} domestic label.\n\nValue these items from the attached frame:\n${JSON.stringify(request, null, 2)}`;
+
+  const ebayCredentials = options.ebayCredentials;
+  const searchEbay = ebayCredentials && tool({
+    name: "search_ebay_active_listings",
+    description:
+      'Secondary market-research tool that may run in parallel with retailer-focused web search once the product identity is specific enough. Searches live eBay fixed-price listings in the reseller\'s market and returns asking prices with condition and shipping. These are active listings, never completed sales or the primary retail-price baseline.',
+    parameters: z.object({
+      itemIndex: z.number().int().min(0).describe("Index of the item these listings are for."),
+      query: z.string().min(2).max(300).describe("Search query with brand, item type, and key attributes."),
+    }),
+    execute: async ({ itemIndex, query }) => {
+      const result = await searchEbayActive(ebayCredentials, query, options.market);
+      if (itemIndex < options.items.length) options.onComps(itemIndex, result.comps);
+      return {
+        total: result.total,
+        error: result.error,
+        listings: result.comps.slice(0, 12).map((comp) => ({
+          title: comp.title,
+          priceCents: comp.priceCents,
+          shippingCents: comp.shippingCents,
+          currency: comp.currency,
+          condition: comp.condition,
+        })),
+      };
+    },
+  });
 
   const agent = new Agent({
     name: "Yard Sale Gold Researcher",
@@ -265,7 +327,7 @@ export async function researchItems(options: {
     instructions: RESEARCH_INSTRUCTIONS,
     tools: [
       webSearchTool({ searchContextSize: "low", externalWebAccess: true }),
-      ...createEbayTools(options.ebayCredentials),
+      ...(searchEbay ? [searchEbay] : []),
     ],
     outputType: researchSchema,
   });

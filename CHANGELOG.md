@@ -2,7 +2,54 @@
 
 All notable changes to Yard Sale Gold. Dates use ISO 8601.
 
-## [Unreleased] — 2026-09-23
+## [Unreleased] — comps and markets
+
+### Added
+
+- **US and Canada markets.** A Settings choice of United States (USD) or Canada (CAD). New finds are priced in that currency, with USPS or Canada Post shipping, eBay.com or eBay.ca listings, and that country's platform fees.
+- **Better comps.**
+  - eBay active listings are recorded as structured comps for each item (condition, shipping, source).
+  - eBay image search for frames with one item.
+  - Optional PriceCharting (`PRICECHARTING_TOKEN`): sold-based prices for games, cards, comics, LEGO, and Funko.
+  - Optional Discogs (`DISCOGS_TOKEN`): lowest price and listing count for media.
+  - Comps in other currencies are converted with the daily ECB rate (Frankfurter). The original price is kept.
+- **Comp math in code** (`src/comps.ts`, `worker/comps/pipeline.ts`). Each provider comp gets a match score (Jev when set up, else a token match). The code then takes the median and range for sold, listed, and retail comps, after it removes poor matches, outliers, and old sales. The sold and listed medians replace the model's figures when there is enough evidence. The sheet shows the counts, ranges, evidence strength, and a match percentage for each comp.
+- **Barcodes.** The browser reads UPC, EAN, and ISBN codes, natively or with the ZXing ponyfill, from live video and uploaded photos. The server looks them up with Open Library and UPCitemdb. Luna links each code to its item, and the lookups use the exact identity. A new barcode always sends a frame.
+- **Where to sell.** A table of the net on each platform (local, eBay, Mercari, Poshmark, Facebook shipped, and Etsy for vintage), with the best option marked.
+- **Buy / negotiate / pass.** A maximum offer from your minimum profit and minimum ROI targets (Settings; defaults $10 and 100%). It is shown in the sheet and as a badge on each card.
+- **Live price labels.** Labels on the camera view follow each find as the camera moves. Tap a label to open the find.
+- New item fields: `goodsType`, `vintage`, and `barcode`. New comp fields: `source`, `soldAt`, `condition`, `shippingCents`, `matchScore`, `originalPriceCents`, and `originalCurrency`.
+- Migration `0005_comps_and_markets`.
+
+### Changed
+
+- Research replaces an item's comps with one consolidated list (up to 40), so that repeated research does not add duplicates.
+- Comps found by code now update the prices even when the research model fails.
+- Canadian dollar amounts show as `CA$`, so they are not confused with US dollars.
+- `worker/ebay.ts` moved to `worker/comps/ebay.ts`.
+- A saved find keeps the currency it was first priced in. When you scan it again in the other market, it keeps its prices and comps and is not priced again.
+
+### Fixed in review (before release)
+
+- PriceCharting gave only its loose price, whatever the item's condition. It now gives one price that fits the condition (loose, complete in box, or new) and ignores graded, box-only, and manual-only prices.
+- A PriceCharting or Discogs keyword search result was trusted like a barcode lookup. Only barcode lookups get the exact-match score now.
+- Comps the research model picked were not scored, and a listing it copied from a tool result counted twice. All comps are now scored, and duplicates are found by URL or by title and price.
+- PriceCharting calls go through a 1-per-second queue with a 6-hour cache. Barcode identities are cached for 24 hours.
+- A barcode or scene was marked as sent even when the frame was dropped because all slots were busy.
+- A new live label could jump to a different object of the same kind. New labels now need a close overlap first, and late answers get no labels.
+- The research request did not use the normalized barcode or the market currency.
+- Saved offer targets were not range-checked. Comps from D1 were not sorted by match score. Barcodes are read from a frame scaled to at most 1280 px. Price labels can be used with the keyboard and stay inside the frame.
+- D1 allows only 100 bound parameters in one statement, so comps are inserted in small chunks in one atomic batch.
+
+From the Copilot review of pull request #2:
+
+- A rescan in the other market changed a saved find's currency without converting its prices. Saved finds now keep their currency.
+- An item could get a valid but invented barcode from the model and pull another product's prices. An item's barcode must now be one the device read in that frame, on that item when its position is known.
+- Comps saved before match scoring had no score and counted as perfect matches. Unscored comps are now shown as "not scored" and are not used.
+- Keyboard focus on a live price label was not visible.
+- A barcode that the lookup service did not know was looked up again on every frame. Not-found answers are now cached for 24 hours; only failures are retried.
+
+## Two-stage pricing — 2026-09-23 (branch `feature/two-stage-pricing`)
 
 ### Added
 
