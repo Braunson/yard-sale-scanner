@@ -787,8 +787,7 @@ async function getLedgerItems(env: Env): Promise<DetectedItem[]> {
     .select()
     .from(items)
     .where(or(isNotNull(items.ledgerPurchaseCents), isNotNull(items.ledgerSaleCents)))
-    .orderBy(desc(sql`coalesce(${items.ledgerSoldAt}, ${items.ledgerPurchasedAt})`))
-    .limit(1_000);
+    .orderBy(desc(sql`coalesce(${items.ledgerSoldAt}, ${items.ledgerPurchasedAt})`));
   return hydrateItems(env, rows);
 }
 
@@ -850,14 +849,15 @@ async function getAgentRunForItem(env: Env, itemId: string): Promise<AgentRunHis
 async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): Promise<DetectedItem[]> {
   const db = drizzle(env.DB);
   const ids = rows.map((row) => row.id);
-  const sources =
-    ids.length === 0
-      ? []
-      : await db
-          .select()
-          .from(valuationSources)
-          .where(inArray(valuationSources.itemId, ids))
-          .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 0)`));
+  // D1 allows 100 bound parameters per statement, so large lists (the ledger) are read in chunks.
+  const sources: Array<typeof valuationSources.$inferSelect> = [];
+  for (let start = 0; start < ids.length; start += 90) {
+    sources.push(...await db
+      .select()
+      .from(valuationSources)
+      .where(inArray(valuationSources.itemId, ids.slice(start, start + 90)))
+      .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 0)`)));
+  }
   const sourceMap = new Map<string, Comparable[]>();
   for (const source of sources) {
     const comparables = sourceMap.get(source.itemId) ?? [];

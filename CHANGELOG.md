@@ -20,6 +20,13 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
 - A platform with no fee shows "—", not "−$0".
 - A find that was in two lists (for example live and history) could appear twice in the item sheet's frame list, with duplicate React keys.
 
+From the Copilot review of pull request #3:
+
+- `GET /api/ledger` stopped at 1,000 entries, so totals could undercount. It now returns every entry.
+- Loading comps for more than about 100 finds at once went over D1's limit of 100 bound parameters. Comps are now read in chunks.
+- An array request body was read as an empty ledger and could erase an entry. It is now rejected.
+- Ledger amounts could change currency if a find was rescanned in the other market. Saved finds now keep their currency (see the fix from the review of #2).
+
 ## Comps and markets — branch `feature/comps-markets`
 
 ### Added

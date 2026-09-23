@@ -26,7 +26,10 @@ function date(value: unknown, field: string): string | null {
  * re-pricing cannot change the accuracy figures.
  */
 export function buildLedger(body: unknown, item: DetectedItem, now = new Date().toISOString()): Ledger {
-  if (typeof body !== "object" || body === null) throw new LedgerInputError("A ledger object is required.");
+  // Arrays are objects too; an array body must not be read as an empty ledger and erase the entry.
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new LedgerInputError("A ledger object is required.");
+  }
   const input = body as Record<string, unknown>;
   const purchaseCents = cents(input.purchaseCents, "purchaseCents");
   const saleCents = cents(input.saleCents, "saleCents");

@@ -42,6 +42,8 @@ describe("buildLedger", () => {
   });
 
   it("rejects bad amounts, dates, and platforms from another market", () => {
+    expect(() => buildLedger([], item, now)).toThrow("A ledger object is required.");
+    expect(() => buildLedger(null, item, now)).toThrow(LedgerInputError);
     expect(() => buildLedger({ purchaseCents: -1 }, item, now)).toThrow(LedgerInputError);
     expect(() => buildLedger({ purchaseCents: 12.5 }, item, now)).toThrow(LedgerInputError);
     expect(() => buildLedger({ purchaseCents: 100, purchasedAt: "soon" }, item, now)).toThrow(LedgerInputError);
