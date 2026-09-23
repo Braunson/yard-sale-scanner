@@ -26,7 +26,7 @@ import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
 import { type TriageDecision, type TriageRun, triageItems } from "./triage";
 import { isResearchStale, keepsExistingPricing } from "./research";
-import { isValidBarcode, lookupBarcode } from "./comps/identity";
+import { deviceBarcodeForItem, isValidBarcode, lookupBarcode } from "./comps/identity";
 import { finalizeComps, MAX_COMPS_PER_ITEM, pricesFromStats, specialistComps } from "./comps/pipeline";
 import { MARKET_CONFIG } from "./comps/types";
 
@@ -223,6 +223,7 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
           thumbnailKey,
           capturedAt,
           currency,
+          deviceBarcodes: barcodes,
         });
         if (saved) savedRows.set(saved.row.id, saved);
       }
@@ -466,6 +467,8 @@ async function saveIdentifiedItem(
     capturedAt: string;
     /** The market currency; every price for a new find is in this currency. */
     currency: string;
+    /** Barcodes the device read in this frame; the only codes an item may have. */
+    deviceBarcodes: DeviceBarcode[];
   },
 ): Promise<SavedItem | null> {
   const { candidate, decision, knownFingerprints, capturedAt } = options;
@@ -496,7 +499,7 @@ async function saveIdentifiedItem(
     currency: options.currency,
     goodsType: candidate.goodsType,
     vintage: candidate.vintage,
-    barcode: candidate.barcode && isValidBarcode(candidate.barcode) ? candidate.barcode.replace(/\D/g, "") : null,
+    barcode: deviceBarcodeForItem(candidate.barcode, candidate.boundingBox, options.deviceBarcodes),
     thumbnailKey: options.thumbnailKey,
     boxXMin: candidate.boundingBox.xMin,
     boxYMin: candidate.boundingBox.yMin,
@@ -802,7 +805,7 @@ async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): P
           .select()
           .from(valuationSources)
           .where(inArray(valuationSources.itemId, ids))
-          .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 1)`));
+          .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 0)`));
   const sourceMap = new Map<string, Comparable[]>();
   for (const source of sources) {
     const comparables = sourceMap.get(source.itemId) ?? [];

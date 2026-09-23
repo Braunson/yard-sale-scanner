@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { clearBarcodeCache, isValidBarcode, lookupBarcode } from "./identity";
+import { clearBarcodeCache, deviceBarcodeForItem, isValidBarcode, lookupBarcode } from "./identity";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -93,6 +93,22 @@ describe("lookupBarcode", () => {
 });
 
 describe("lookupBarcode cache", () => {
+  it("keeps a code the service does not know, so it is not looked up on every frame", async () => {
+    const fetchMock = vi.fn(async () => Response.json({ code: "OK", total: 0, items: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await lookupBarcode("036000291452")).source).toBeNull();
+    expect((await lookupBarcode("036000291452")).source).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an ISBN that Open Library returns 404 for", async () => {
+    const fetchMock = vi.fn(async () => new Response("", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await lookupBarcode("9780306406157");
+    await lookupBarcode("9780306406157");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("looks up a code once, and tries again after a failure", async () => {
     const fetchMock = vi
       .fn()
@@ -103,5 +119,21 @@ describe("lookupBarcode cache", () => {
     expect((await lookupBarcode("036000291452")).title).toBe("Ketchup");
     expect((await lookupBarcode("036000291452")).title).toBe("Ketchup");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("deviceBarcodeForItem", () => {
+  const item = { xMin: 100, yMin: 100, xMax: 500, yMax: 500 };
+  const read = (value: string, box: { xMin: number; yMin: number; xMax: number; yMax: number } | null) => ({ value, format: "ean_13", box });
+
+  it("accepts only codes the device read, and on the item when the position is known", () => {
+    expect(deviceBarcodeForItem("978-0-306-40615-7", item, [read("9780306406157", { xMin: 200, yMin: 200, xMax: 300, yMax: 250 })])).toBe("9780306406157");
+    expect(deviceBarcodeForItem("9780306406157", item, [read("9780306406157", null)])).toBe("9780306406157");
+  });
+
+  it("rejects an invented code and a code that is on another item", () => {
+    expect(deviceBarcodeForItem("036000291452", item, [read("9780306406157", null)])).toBeNull();
+    expect(deviceBarcodeForItem("9780306406157", item, [read("9780306406157", { xMin: 700, yMin: 700, xMax: 800, yMax: 750 })])).toBeNull();
+    expect(deviceBarcodeForItem(null, item, [])).toBeNull();
   });
 });

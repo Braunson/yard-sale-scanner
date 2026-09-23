@@ -8,6 +8,7 @@ const comp = (priceCents: number, type: Comparable["type"] = "sold", extra: Part
   priceCents,
   currency: "USD",
   type,
+  matchScore: 0.9,
   ...extra,
 });
 
@@ -43,6 +44,10 @@ describe("compStats", () => {
     ], "USD", now);
     expect(stats.sold).toMatchObject({ count: 2, medianCents: 3_100, excluded: 1 });
     expect(stats.confidence).toBe("medium");
+  });
+
+  it("does not use comps that were never scored", () => {
+    expect(compStats([comp(3_000, "sold", { matchScore: null }), comp(3_100, "sold", { matchScore: undefined })], "USD", now).sold).toBeNull();
   });
 
   it("prefers recent sales when there are at least three", () => {

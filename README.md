@@ -150,7 +150,7 @@ The code then does the math, not the model:
 
 1. Converts every comp to the market currency with the daily ECB rate from Frankfurter. The original price is kept.
 2. Removes duplicates by URL and by title plus price, so a listing the model copied from a tool result counts once.
-3. Scores every comp, including the ones the research model picked, for "same product, comparable condition": with Jev when `TYPESAFE_API_KEY` is set, or with a token match on brand, model, and name. A barcode lookup on PriceCharting or Discogs is exact and scores 0.9; a keyword search on them is scored like any other comp. Comps below 0.6 are shown struck through and are not used.
+3. Scores every comp, including the ones the research model picked, for "same product, comparable condition": with Jev when `TYPESAFE_API_KEY` is set, or with a token match on brand, model, and name. A barcode lookup on PriceCharting or Discogs is exact and scores 0.9; a keyword search on them is scored like any other comp. Comps below 0.6, and comps saved before scoring existed, are shown struck through and are not used.
 4. Computes the median and range for sold, listed, and retail comps, after removing outliers (Tukey fences) and preferring sales from the last 180 days.
 5. Uses the sold median for the online sale price when there are at least 2 sold comps, and the listed median for the active price. Otherwise it keeps the model's figures.
 
@@ -162,7 +162,7 @@ PriceCharting requests go through one queue at most once a second, as its terms 
 
 The browser reads UPC-A, EAN-13, EAN-8, and ISBN barcodes. It uses the native `BarcodeDetector` in Chrome and Android, and the ZXing WebAssembly ponyfill in Safari, iOS, and Firefox. Codes with a bad check digit are ignored. A new barcode always sends a frame, even when the scene has not changed. Barcodes are also read from uploaded photos.
 
-The server looks up each code while Luna identifies the frame: ISBNs with Open Library, and other codes with UPCitemdb (title and brand only; its prices are not reliable). Luna links each code to the item it is on. Research and the PriceCharting and Discogs lookups then use the exact identity.
+The server looks up each code while Luna identifies the frame: ISBNs with Open Library, and other codes with UPCitemdb (title and brand only; its prices are not reliable). Luna links each code to the item it is on. The server keeps a link only when the device read that code in the frame and, when the code's position is known, its center is inside the item's box. Research and the PriceCharting and Discogs lookups then use the exact identity.
 
 ## Live price labels
 

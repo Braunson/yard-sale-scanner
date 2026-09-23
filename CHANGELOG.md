@@ -27,7 +27,7 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
 - Comps found by code now update the prices even when the research model fails.
 - Canadian dollar amounts show as `CA$`, so they are not confused with US dollars.
 - `worker/ebay.ts` moved to `worker/comps/ebay.ts`.
-- Research from an earlier scan is reused only when it is in the same currency. When a find moves to another market, its old comps are removed, and a research update in the old currency cannot overwrite it.
+- A saved find keeps the currency it was first priced in. When you scan it again in the other market, it keeps its prices and comps and is not priced again.
 
 ### Fixed in review (before release)
 
@@ -40,6 +40,14 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
 - The research request did not use the normalized barcode or the market currency.
 - Saved offer targets were not range-checked. Comps from D1 were not sorted by match score. Barcodes are read from a frame scaled to at most 1280 px. Price labels can be used with the keyboard and stay inside the frame.
 - D1 allows only 100 bound parameters in one statement, so comps are inserted in small chunks in one atomic batch.
+
+From the Copilot review of pull request #2:
+
+- A rescan in the other market changed a saved find's currency without converting its prices. Saved finds now keep their currency.
+- An item could get a valid but invented barcode from the model and pull another product's prices. An item's barcode must now be one the device read in that frame, on that item when its position is known.
+- Comps saved before match scoring had no score and counted as perfect matches. Unscored comps are now shown as "not scored" and are not used.
+- Keyboard focus on a live price label was not visible.
+- A barcode that the lookup service did not know was looked up again on every frame. Not-found answers are now cached for 24 hours; only failures are retried.
 
 ## Two-stage pricing — 2026-09-23 (branch `feature/two-stage-pricing`)
 

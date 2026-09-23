@@ -1571,12 +1571,13 @@ function ItemDetail({
                   <h3>Comps</h3>
                   <CompStatsSummary item={item} />
                   {marketEvidence.map((comparable, index) => {
-                    const poorMatch = comparable.matchScore != null && comparable.matchScore < MIN_MATCH_SCORE;
+                    // Unscored comps (saved before match scoring) are shown but not used, like poor matches.
+                    const poorMatch = comparable.type !== "web" && (comparable.matchScore ?? 0) < MIN_MATCH_SCORE;
                     const details = [
                       comparable.source,
                       comparable.condition,
                       comparable.soldAt ? `sold ${new Date(comparable.soldAt).toLocaleDateString()}` : null,
-                      comparable.matchScore != null ? `${Math.round(comparable.matchScore * 100)}% match` : null,
+                      comparable.matchScore != null ? `${Math.round(comparable.matchScore * 100)}% match` : comparable.type === "web" ? null : "not scored",
                       comparable.originalCurrency && comparable.originalPriceCents != null
                         ? `from ${money(comparable.originalPriceCents, comparable.originalCurrency)}`
                         : null,

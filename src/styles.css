@@ -374,6 +374,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visib
 .price-label { cursor: pointer; pointer-events: auto; }
 .price-label rect { fill: rgba(17,18,15,.82); stroke: var(--gold); stroke-width: 1px; }
 .price-label.researching rect { stroke: #b9b3ff; }
+.price-label:focus { outline: none; }
+.price-label:focus-visible rect { stroke: white; stroke-width: 3px; }
 .price-label text { fill: white; font-family: "DM Sans",sans-serif; font-weight: 700; paint-order: normal; stroke: none; }
 .settings-select { width: 100%; padding: 9px 10px; color: white; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.13); border-radius: 12px; }
 .settings-hint { display: block; margin-top: 6px; color: rgba(255,255,255,.5); font-size: 10px; line-height: 1.4; }

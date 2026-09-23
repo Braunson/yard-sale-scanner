@@ -1,3 +1,4 @@
+import type { BoundingBox, DeviceBarcode } from "../../src/types";
 import { PROVIDER_TIMEOUT_MS } from "./types";
 
 export type BarcodeIdentity = {
@@ -21,8 +22,12 @@ export function isValidBarcode(value: string): boolean {
   return (10 - (sum % 10)) % 10 === Number(digits[digits.length - 1]);
 }
 
+/** The service answered and does not know the code. Unlike a failure, this is worth caching. */
+class NotFoundError extends Error {}
+
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url, { signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
+  if (response.status === 404) throw new NotFoundError("Barcode not found");
   if (!response.ok) throw new Error(`Barcode lookup failed with status ${response.status}`);
   return (await response.json()) as T;
 }
@@ -74,23 +79,45 @@ export function lookupBarcode(barcode: string): Promise<BarcodeIdentity> {
   const key = barcode.replace(/\D/g, "");
   const cached = identityCache.get(key);
   if (cached && Date.now() - cached.at < IDENTITY_TTL_MS) return cached.identity;
-  const identity = fetchBarcodeIdentity(barcode).then((result) => {
-    // A failed lookup is not kept, so the next frame can try again.
-    if (!result.source) identityCache.delete(key);
+  const identity = fetchBarcodeIdentity(barcode).then(({ identity: result, failed }) => {
+    // A failed lookup is not kept, so the next frame can try again. A code the service does not
+    // know is kept, so it is not looked up again on every frame.
+    if (failed) identityCache.delete(key);
     return result;
   });
   identityCache.set(key, { at: Date.now(), identity });
   return identity;
 }
 
-async function fetchBarcodeIdentity(barcode: string): Promise<BarcodeIdentity> {
+async function fetchBarcodeIdentity(barcode: string): Promise<{ identity: BarcodeIdentity; failed: boolean }> {
   const digits = barcode.replace(/\D/g, "");
   const kind = digits.length === 13 && /^97[89]/.test(digits) ? "isbn" : "upc";
   const identity: BarcodeIdentity = { barcode: digits, kind, title: null, brand: null, authors: [], source: null };
-  if (!digits) return identity;
+  if (!digits) return { identity, failed: false };
   try {
-    return kind === "isbn" ? await lookupIsbn(identity) : await lookupUpc(identity);
-  } catch {
-    return identity;
+    return { identity: kind === "isbn" ? await lookupIsbn(identity) : await lookupUpc(identity), failed: false };
+  } catch (error) {
+    return { identity, failed: !(error instanceof NotFoundError) };
   }
+}
+
+/**
+ * Luna links barcodes to items, but its answer is model output. Accept a code only when the device
+ * read it in this frame, and, when the device reported where it was, only when its center is inside
+ * the item's box. This stops an invented but valid code from pulling another product's prices.
+ */
+export function deviceBarcodeForItem(
+  claimed: string | null,
+  itemBox: BoundingBox,
+  deviceBarcodes: DeviceBarcode[],
+): string | null {
+  const digits = claimed?.replace(/\D/g, "") ?? "";
+  if (!digits) return null;
+  const read = deviceBarcodes.find((barcode) => barcode.value === digits);
+  if (!read) return null;
+  if (!read.box) return digits;
+  const centerX = (read.box.xMin + read.box.xMax) / 2;
+  const centerY = (read.box.yMin + read.box.yMax) / 2;
+  const inside = centerX >= itemBox.xMin && centerX <= itemBox.xMax && centerY >= itemBox.yMin && centerY <= itemBox.yMax;
+  return inside ? digits : null;
 }

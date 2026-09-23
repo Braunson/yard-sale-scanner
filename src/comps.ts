@@ -60,7 +60,8 @@ function usable(comp: Comparable, currency: string): comp is Comparable & { pric
 export function compStats(comps: Comparable[], currency: string, now = Date.now()): CompStats {
   const byType = (type: Comparable["type"]) => {
     const ofType = comps.filter((comp) => comp.type === type && usable(comp, currency));
-    const matched = ofType.filter((comp) => (comp.matchScore ?? 1) >= MIN_MATCH_SCORE);
+    // Comps saved before match scoring have no score; they never passed the same-product check.
+    const matched = ofType.filter((comp) => (comp.matchScore ?? 0) >= MIN_MATCH_SCORE);
     return { matched, poorMatches: ofType.length - matched.length };
   };
 
