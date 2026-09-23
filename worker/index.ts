@@ -23,6 +23,7 @@ import {
 import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db/schema";
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
 import { type TriageDecision, type TriageRun, triageItems } from "./triage";
+import { isResearchStale, keepsExistingPricing } from "./research";
 
 const MAX_FRAME_BYTES = 2_500_000;
 
@@ -259,12 +260,12 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
                   pricingStatus: "priced",
                   researchedAt,
                 })
-                .where(eq(items.id, saved.row.id))
+                .where(ownsResearch(saved.row))
                 .returning()
             : await db
                 .update(items)
                 .set({ pricingStatus: "research_failed" })
-                .where(and(eq(items.id, saved.row.id), eq(items.pricingStatus, "researching")))
+                .where(ownsResearch(saved.row))
                 .returning();
           if (!updated) continue;
           updatedRows.push(updated);
@@ -336,11 +337,12 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
       console.error(JSON.stringify({ message: "frame analysis failed", frameId, error: message }));
       const cleanup: Array<Promise<unknown>> = [];
       if (savedRows.size > 0) {
-        // Saved finds keep their thumbnail; anything still waiting for research falls back to its quick price.
-        cleanup.push(db
-          .update(items)
-          .set({ pricingStatus: "research_failed" })
-          .where(and(inArray(items.id, [...savedRows.keys()]), eq(items.pricingStatus, "researching"))));
+        // Saved finds keep their thumbnail; research this frame owns falls back to its quick price.
+        for (const saved of savedRows.values()) {
+          if (saved.needsResearch) {
+            cleanup.push(db.update(items).set({ pricingStatus: "research_failed" }).where(ownsResearch(saved.row)));
+          }
+        }
       } else {
         cleanup.push(env.THUMBNAILS.delete(thumbnailKey));
       }
@@ -390,8 +392,6 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
 
 type SavedItem = { row: typeof items.$inferSelect; candidate: IdentifiedItem; duplicate: boolean; needsResearch: boolean };
 
-/** A previously researched item is re-used for this long instead of paying for new web searches. */
-const RESEARCH_REUSE_MS = 14 * 24 * 60 * 60 * 1000;
 
 async function saveIdentifiedItem(
   db: ReturnType<typeof drizzle>,
@@ -422,16 +422,6 @@ async function saveIdentifiedItem(
   if (options.frameFingerprints.has(fingerprint)) return null;
   options.frameFingerprints.add(fingerprint);
 
-  const existing = await db.select().from(items).where(eq(items.fingerprint, fingerprint)).limit(1).then((rows) => rows[0]);
-  const researchAgeMs = existing?.researchedAt ? Date.parse(capturedAt) - Date.parse(existing.researchedAt) : null;
-  // Keep earlier research when it is fresh, when the new triage would only give a quick guess, or
-  // when another frame is researching this item right now.
-  const reuseResearch = Boolean(existing) && (
-    (existing?.pricingStatus === "priced" && researchAgeMs !== null &&
-      (researchAgeMs < RESEARCH_REUSE_MS || decision.path === "instant")) ||
-    (existing?.pricingStatus === "researching" && !isResearchStale(existing.researchStartedAt, capturedAt))
-  );
-
   const identity = {
     name: candidate.name,
     category: candidate.category,
@@ -450,44 +440,28 @@ async function saveIdentifiedItem(
     rawJson: JSON.stringify(candidate),
     lastSeenAt: capturedAt,
   };
-  const pricing = reuseResearch && existing
-    ? {
-        estimatedLowCents: existing.estimatedLowCents,
-        estimatedHighCents: existing.estimatedHighCents,
-        retailPriceCents: existing.retailPriceCents,
-        activePriceCents: existing.activePriceCents,
-        soldPriceCents: existing.soldPriceCents,
-        onlineSaleCents: existing.onlineSaleCents,
-        shippingCents: existing.shippingCents,
-        valueSummary: existing.valueSummary,
-        pricingPath: "research" as const,
-        pricingStatus: existing.pricingStatus,
-        triageSource: "reused" as const,
-        triageConfidence: null,
-        researchReason: existing.researchReason,
-        researchedAt: existing.researchedAt,
-        researchStartedAt: existing.researchStartedAt,
-      }
-    : {
-        estimatedLowCents: candidate.quickLowCents,
-        estimatedHighCents: candidate.quickHighCents,
-        retailPriceCents: null,
-        activePriceCents: null,
-        soldPriceCents: null,
-        onlineSaleCents: candidate.onlineSaleCents,
-        shippingCents: candidate.shippingCents,
-        valueSummary: candidate.quickSummary,
-        pricingPath: decision.path,
-        pricingStatus: decision.path === "research" ? ("researching" as const) : ("priced" as const),
-        triageSource: decision.source,
-        triageConfidence: decision.confidence,
-        researchReason: candidate.researchReason,
-        researchedAt: null,
-        researchStartedAt: decision.path === "research" ? capturedAt : null,
-      };
+  const pricing = {
+    estimatedLowCents: candidate.quickLowCents,
+    estimatedHighCents: candidate.quickHighCents,
+    retailPriceCents: null,
+    activePriceCents: null,
+    soldPriceCents: null,
+    onlineSaleCents: candidate.onlineSaleCents,
+    shippingCents: candidate.shippingCents,
+    valueSummary: candidate.quickSummary,
+    pricingPath: decision.path,
+    pricingStatus: decision.path === "research" ? ("researching" as const) : ("priced" as const),
+    triageSource: decision.source,
+    triageConfidence: decision.confidence,
+    researchReason: candidate.researchReason,
+    researchedAt: null,
+    researchStartedAt: decision.path === "research" ? capturedAt : null,
+  };
 
+  // A new row is inserted with its pricing. For an existing row the conflict update only refreshes
+  // identity, so a stale read can never overwrite pricing that another frame just wrote.
   const proposedId = crypto.randomUUID();
-  const [row] = await db
+  const [upserted] = await db
     .insert(items)
     .values({
       id: proposedId,
@@ -500,22 +474,48 @@ async function saveIdentifiedItem(
     })
     .onConflictDoUpdate({
       target: items.fingerprint,
-      set: { ...identity, ...pricing, seenCount: sql`${items.seenCount} + 1` },
+      set: { ...identity, seenCount: sql`${items.seenCount} + 1` },
     })
     .returning();
-  if (!row) throw new Error("D1 did not return the saved item.");
-  const duplicate = proposedId !== row.id;
-  if (!duplicate) knownFingerprints.push({ id: row.id, fingerprint });
-  // A row that another frame is still researching must not be researched again here.
-  return { row, candidate, duplicate, needsResearch: !reuseResearch && row.pricingStatus === "researching" };
+  if (!upserted) throw new Error("D1 did not return the saved item.");
+  const duplicate = proposedId !== upserted.id;
+  if (!duplicate) {
+    knownFingerprints.push({ id: upserted.id, fingerprint });
+    return { row: upserted, candidate, duplicate, needsResearch: upserted.pricingStatus === "researching" };
+  }
+
+  if (keepsExistingPricing(upserted, decision, capturedAt)) {
+    return { row: upserted, candidate, duplicate, needsResearch: false };
+  }
+  // Claim the row: the new pricing applies only if nobody changed the pricing state since the
+  // upsert read it. Of two frames that race, only the winner researches.
+  const [claimed] = await db
+    .update(items)
+    .set(pricing)
+    .where(and(
+      eq(items.id, upserted.id),
+      eq(items.pricingStatus, upserted.pricingStatus),
+      sql`${items.researchStartedAt} IS ${upserted.researchStartedAt}`,
+      sql`${items.researchedAt} IS ${upserted.researchedAt}`,
+    ))
+    .returning();
+  if (claimed) return { row: claimed, candidate, duplicate, needsResearch: claimed.pricingStatus === "researching" };
+  const current = await db.select().from(items).where(eq(items.id, upserted.id)).limit(1).then((rows) => rows[0]);
+  return { row: current ?? upserted, candidate, duplicate, needsResearch: false };
 }
 
-/** Research that has not finished after this long was cut off, for example when the Worker stopped. */
-const RESEARCH_TIMEOUT_MS = 10 * 60 * 1000;
-
-function isResearchStale(researchStartedAt: string | null, now: string): boolean {
-  return researchStartedAt === null || Date.parse(now) - Date.parse(researchStartedAt) > RESEARCH_TIMEOUT_MS;
+/**
+ * Only the frame that claimed the research may finish it. A later frame that restarts stale
+ * research sets a new start time, so a late result from the old run no longer matches.
+ */
+function ownsResearch(row: typeof items.$inferSelect) {
+  return and(
+    eq(items.id, row.id),
+    eq(items.pricingStatus, "researching"),
+    sql`${items.researchStartedAt} IS ${row.researchStartedAt}`,
+  );
 }
+
 
 function combineAudits(
   identify: AgentRunAudit,

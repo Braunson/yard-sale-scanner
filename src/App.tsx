@@ -149,6 +149,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const [source, setSource] = useState<Source>("camera");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  /** True after an uploaded video plays to its end; the detector stops on its last frame. */
+  const [mediaEnded, setMediaEnded] = useState(false);
   const [inFlight, setInFlight] = useState(0);
   const [liveItems, setLiveItems] = useState<DetectedItem[]>([]);
   const [streamItemTokens, setStreamItemTokens] = useState<Record<string, number>>({});
@@ -615,6 +617,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
   };
 
   function stopMedia() {
+    setMediaEnded(false);
     if (intervalRef.current !== null) window.clearInterval(intervalRef.current);
     intervalRef.current = null;
     setScanning(false);
@@ -631,7 +634,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
     lastVideoTimeRef.current = -1;
   }
 
-  const detectorActive = view === "scan" && deviceDetectionEnabled && Boolean(sessionId) && source !== "image";
+  const detectorActive =
+    view === "scan" && deviceDetectionEnabled && Boolean(sessionId) && source !== "image" && !mediaEnded;
   useEffect(() => {
     if (!detectorActive) {
       latestDetectionsRef.current = null;
@@ -753,7 +757,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
       {view === "scan" ? (
         <main className="immersive-scan">
           <section className="camera-stage">
-            <video ref={videoRef} playsInline onEnded={stopScan} />
+            <video ref={videoRef} playsInline onEnded={() => { stopScan(); setMediaEnded(true); }} />
             {liveDetections && liveDetections.width > 0 && (
               <svg
                 className="detection-overlay"

@@ -30,7 +30,9 @@ describe("decidePath", () => {
     expect(decidePath(mug, choice(0.6)).path).toBe("research");
   });
 
-  it("always researches items that might be valuable", () => {
+  it("always researches items that might be valuable or have no high estimate", () => {
+    expect(decidePath({ ...mug, quickHighCents: null }, choice(0.99)).path).toBe("research");
+    expect(decidePath({ ...mug, quickHighCents: null }, null).path).toBe("research");
     expect(decidePath({ ...mug, quickHighCents: 8_000 }, choice(0.99))).toEqual({
       path: "research",
       source: "jev",

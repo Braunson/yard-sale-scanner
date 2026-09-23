@@ -10,7 +10,7 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
   - The identify stage (Luna) returns a quick local price, a typical online sale price, a shipping estimate, a `pricingHint` (`instant` or `research`), and a reason.
   - The research stage (Luna + web search + eBay) runs in one batch for the items that need research. It returns retail, active, sold, online-sale, shipping, and resale-range prices with comps.
   - Research from the last 14 days is reused, so the app does not search again for an item it has seen.
-- **Optional Jev triage** (`worker/triage.ts`). When `TYPESAFE_API_KEY` is set, one TypeSafe Jev call decides for each item if it can be priced now. An item skips research only if Jev is at least 70% sure. Items that can be worth $50 or more are always researched. If Jev is not set up, fails, or takes more than 4 s, Luna's hint decides.
+- **Optional Jev triage** (`worker/triage.ts`). When `TYPESAFE_API_KEY` is set, one TypeSafe Jev call decides for each item if it can be priced now. An item skips research only if Jev is at least 70% sure. Items that can be worth $50 or more, or have no high estimate, are always researched. If Jev is not set up, fails, or takes more than 4 s, Luna's hint decides.
 - **`PRICING_TRIAGE` setting.** `auto` (default) or `research_all`. `research_all` gives the old behavior: every item is researched.
 - **Streamed results.** `POST /api/analyze` returns NDJSON events: `identified`, then `researched`, then `done` or `error`. Quick prices show immediately and change when research is done. A frame's concurrency slot is released after the quick prices arrive.
 - **On-device object detection** (`src/detector.ts`, `src/detection.ts`). MediaPipe EfficientDet-Lite0 runs in the browser at about 5 fps.
@@ -53,3 +53,11 @@ These problems were found in review before release:
 - Old boxes stayed on screen after the video stopped. A detector error now turns detection off and does not throw on every frame.
 - A stream that closed without a final event was treated as a success.
 - The UI showed "Jev … 5% sure" when the $50 rule, not Jev, forced research.
+
+From the Copilot review of pull request #1:
+
+- Two frames that saw a new find at the same time could both run web research. Pricing is now claimed with a conditional update, and only the winner researches.
+- A rescan wrote a stale snapshot of pricing back to the row, which could undo research that had just finished. The conflict update now changes only identity fields.
+- A late result from research that had timed out could overwrite newer research. Research is finished only by the run that owns its start time.
+- An item with no high estimate could skip research. It is now always researched.
+- On-device detection kept running on the last frame after an uploaded video ended.

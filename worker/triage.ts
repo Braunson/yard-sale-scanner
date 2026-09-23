@@ -4,7 +4,10 @@ const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const JEV_TIMEOUT_MS = 4_000;
 /** Jev must be at least this sure before an item skips web research. */
 export const INSTANT_PROBABILITY_THRESHOLD = 0.7;
-/** Anything that might be worth this much always gets researched, whatever the triage says. */
+/**
+ * Anything that might be worth this much always gets researched, whatever the triage says. An
+ * unknown high estimate counts too, because the item could be worth more.
+ */
 export const ALWAYS_RESEARCH_CENTS = 5_000;
 
 export type TriageCandidate = {
@@ -82,7 +85,7 @@ export async function triageItems(
 }
 
 export function decidePath(candidate: TriageCandidate, jevAnswer: JevChoiceAnswer | null): TriageDecision {
-  const mightBeValuable = (candidate.quickHighCents ?? 0) >= ALWAYS_RESEARCH_CENTS;
+  const mightBeValuable = candidate.quickHighCents === null || candidate.quickHighCents >= ALWAYS_RESEARCH_CENTS;
 
   if (jevAnswer?.type === "choice") {
     const instantProbability = jevAnswer.probabilities.instant ?? 0;
