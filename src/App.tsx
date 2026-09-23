@@ -23,11 +23,25 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { gateFrame, sellableDetections } from "./detection";
 import { detectVideoFrame, loadDetector } from "./detector";
-import { MARKETPLACE_FEE_RATE, MARKETPLACE_FIXED_FEE_CENTS, localResaleCents, onlineOutlook, tagMargin } from "./pricing";
-import type { AgentRunHistory, AnalysisEvent, DetectedItem, DeviceDetection, HistoryPage, Stats } from "./types";
+import { loadBarcodeReader, readBarcodes } from "./barcodes";
+import { MARKETS } from "./markets";
+import { mergeTracks, seedTracks, type Track, TRACK_MAX_SEED_DELAY_MS, updateTracks } from "./tracking";
+import { compStats, MIN_MATCH_SCORE, type PriceStats } from "./comps";
+import { DEFAULT_OFFER_TARGETS, localResaleCents, offerAdvice, type OfferTargets, saleOutlook, tagMargin } from "./pricing";
+import type {
+  AgentRunHistory,
+  AnalysisEvent,
+  Comparable,
+  DetectedItem,
+  DeviceBarcode,
+  DeviceDetection,
+  HistoryPage,
+  Market,
+  Stats,
+} from "./types";
 
 const EMPTY_STATS: Stats = {
   framesProcessed: 0,
@@ -40,6 +54,11 @@ const DEFAULT_MAX_CONCURRENT_FRAMES = 5;
 const MAX_CONCURRENT_FRAMES_SETTING = 100;
 const FIND_CRITERIA_STORAGE_KEY = "yard-sale-find-criteria";
 const DEVICE_DETECTION_STORAGE_KEY = "yard-sale-device-detection";
+const MARKET_STORAGE_KEY = "yard-sale-market";
+const OFFER_TARGETS_STORAGE_KEY = "yard-sale-offer-targets";
+const BARCODE_INTERVAL_MS = 700;
+/** A barcode stays attached to captures this long after it was last read. */
+const BARCODE_TTL_MS = 3_000;
 const DETECTION_INTERVAL_MS = 200;
 /** A still scene is re-sent after this long, because COCO does not know many sale items. */
 const MAX_QUIET_MS = 20_000;
@@ -55,6 +74,8 @@ const FIND_CRITERIA_PRESETS = [
 type View = "scan" | "history";
 type Source = "camera" | "video" | "image";
 type DetectorStatus = "off" | "loading" | "ready" | "failed";
+
+const OfferTargetsContext = createContext<OfferTargets>(DEFAULT_OFFER_TARGETS);
 
 async function readAnalysisStream(body: ReadableStream<Uint8Array>, onEvent: (event: AnalysisEvent) => void) {
   const reader = body.getReader();
@@ -177,6 +198,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const [detectorStatus, setDetectorStatus] = useState<DetectorStatus>("off");
   const [liveDetections, setLiveDetections] = useState<{
     detections: DeviceDetection[];
+    tracks: Track[];
     width: number;
     height: number;
     unitsPerPixel: number;
@@ -185,6 +207,27 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const lastSentDetectionsRef = useRef<DeviceDetection[] | null>(null);
   const lastSentAtRef = useRef(0);
   const [skippedFrames, setSkippedFrames] = useState(0);
+  const [market, setMarket] = useState<Market>(() =>
+    window.localStorage.getItem(MARKET_STORAGE_KEY) === "CA" ? "CA" : "US",
+  );
+  const marketRef = useRef(market);
+  const [offerTargets, setOfferTargets] = useState<OfferTargets>(() => {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(OFFER_TARGETS_STORAGE_KEY) ?? "null") as Partial<OfferTargets> | null;
+      if (saved && Number.isFinite(saved.minProfitCents) && Number.isFinite(saved.minRoi)) {
+        return {
+          minProfitCents: Math.min(10_000, Math.max(0, Math.round(saved.minProfitCents!))),
+          minRoi: Math.min(5, Math.max(0, saved.minRoi!)),
+        };
+      }
+    } catch {
+      // Fall through to the defaults when the saved value is not valid JSON.
+    }
+    return DEFAULT_OFFER_TARGETS;
+  });
+  const latestBarcodesRef = useRef<{ codes: DeviceBarcode[]; at: number }>({ codes: [], at: 0 });
+  const lastSentBarcodesRef = useRef<string[]>([]);
+  const tracksRef = useRef<Track[]>([]);
   const [researching, setResearching] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
@@ -236,6 +279,15 @@ export default function App({ children }: { children?: React.ReactNode }) {
       void audioContextRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    marketRef.current = market;
+    window.localStorage.setItem(MARKET_STORAGE_KEY, market);
+  }, [market]);
+
+  useEffect(() => {
+    window.localStorage.setItem(OFFER_TARGETS_STORAGE_KEY, JSON.stringify(offerTargets));
+  }, [offerTargets]);
 
   useEffect(() => {
     deviceDetectionEnabledRef.current = deviceDetectionEnabled;
@@ -352,8 +404,16 @@ export default function App({ children }: { children?: React.ReactNode }) {
   }, [queryClient]);
 
   const submitBlob = useCallback(
-    async (activeSessionId: string, blob: Blob, deviceDetections: DeviceDetection[] = []) => {
+    async (
+      activeSessionId: string,
+      blob: Blob,
+      deviceDetections: DeviceDetection[] = [],
+      barcodes: DeviceBarcode[] = [],
+      onAccepted?: () => void,
+    ) => {
       if (inFlightRef.current >= maxConcurrentFramesRef.current) return;
+      onAccepted?.();
+      const capturedAtMs = performance.now();
       inFlightRef.current += 1;
       setInFlight(inFlightRef.current);
       // The concurrency slot is released once quick prices arrive; research continues in the background.
@@ -370,7 +430,9 @@ export default function App({ children }: { children?: React.ReactNode }) {
         form.set("sessionId", activeSessionId);
         form.set("capturedAt", new Date().toISOString());
         form.set("findCriteria", findCriteriaRef.current);
+        form.set("market", marketRef.current);
         if (deviceDetections.length > 0) form.set("deviceDetections", JSON.stringify(deviceDetections));
+        if (barcodes.length > 0) form.set("barcodes", JSON.stringify(barcodes));
         form.set("image", blob, "frame.jpg");
         const response = await fetch("/api/analyze", { method: "POST", body: form });
         if (!response.ok || !response.body) {
@@ -387,6 +449,12 @@ export default function App({ children }: { children?: React.ReactNode }) {
               setResearching((current) => current + 1);
             }
             if (event.items.length > 0) {
+              // Live price labels start on the detector boxes that were sent with this frame. A late
+              // answer gets no labels, because the camera has probably moved since the capture.
+              const now = performance.now();
+              if (deviceDetections.length > 0 && now - capturedAtMs <= TRACK_MAX_SEED_DELAY_MS) {
+                tracksRef.current = mergeTracks(tracksRef.current, seedTracks(event.items, deviceDetections, now));
+              }
               streamQueueRef.current.push(...event.items);
               startItemStream();
               playFoundSound();
@@ -429,15 +497,23 @@ export default function App({ children }: { children?: React.ReactNode }) {
           msSinceLastSent: Date.now() - lastSentAtRef.current,
           maxQuietMs: MAX_QUIET_MS,
         });
-        if (!decision.send) {
+        const freshBarcodes = performance.now() - latestBarcodesRef.current.at < BARCODE_TTL_MS ? latestBarcodesRef.current.codes : [];
+        const newBarcode = freshBarcodes.some((code) => !lastSentBarcodesRef.current.includes(code.value));
+        if (!decision.send && !newBarcode) {
           setSkippedFrames((current) => current + 1);
           return;
         }
       }
       const hints = detections ? sellableDetections(detections) : [];
-      lastSentDetectionsRef.current = hints;
-      lastSentAtRef.current = Date.now();
-      lastVideoTimeRef.current = video.currentTime;
+      const barcodes = performance.now() - latestBarcodesRef.current.at < BARCODE_TTL_MS ? latestBarcodesRef.current.codes : [];
+      const frameTime = video.currentTime;
+      // The gate state changes only when the frame is really sent, not when all slots are busy.
+      const markSent = () => {
+        lastSentBarcodesRef.current = barcodes.map((code) => code.value);
+        lastSentDetectionsRef.current = hints;
+        lastSentAtRef.current = Date.now();
+        lastVideoTimeRef.current = frameTime;
+      };
 
       const scale = Math.min(1, 960 / video.videoWidth);
       canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
@@ -448,7 +524,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
       onCaptured?.();
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.76));
       if (!blob) return;
-      await submitBlob(activeSessionId, blob, hints);
+      await submitBlob(activeSessionId, blob, hints, barcodes, markSent);
     },
     [submitBlob],
   );
@@ -602,9 +678,12 @@ export default function App({ children }: { children?: React.ReactNode }) {
       playSnapshotFeedback();
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.82));
       if (!blob) throw new Error("The selected image could not be prepared.");
+      const barcodes = deviceDetectionEnabledRef.current
+        ? await loadBarcodeReader().then((reader) => readBarcodes(reader, canvas)).catch(() => [])
+        : [];
       setSourceLabel(file.name);
       const id = await beginSession("image", file.name);
-      await submitBlob(id, blob);
+      await submitBlob(id, blob, [], barcodes);
     } catch (imageError) {
       setError(imageError instanceof Error ? imageError.message : "Image could not be loaded");
     }
@@ -639,6 +718,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
   useEffect(() => {
     if (!detectorActive) {
       latestDetectionsRef.current = null;
+      tracksRef.current = [];
       setLiveDetections(null);
       setDetectorStatus("off");
       return;
@@ -660,6 +740,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
           const video = videoRef.current;
           if (!video || video.readyState < 2) {
             latestDetectionsRef.current = null;
+            tracksRef.current = [];
             lastOverlayKey = "";
             setLiveDetections(null);
             return;
@@ -676,14 +757,18 @@ export default function App({ children }: { children?: React.ReactNode }) {
           }
           latestDetectionsRef.current = detections;
           const shown = sellableDetections(detections);
+          tracksRef.current = updateTracks(tracksRef.current, shown, now);
+          const tracks = tracksRef.current;
           // Only re-render when the boxes change, to leave the CPU and GPU for the detector.
+          const boxKey = (box: DeviceDetection["box"]) => Object.values(box).map((value) => Math.round(value / 10)).join(",");
           const overlayKey = `${video.clientWidth}x${video.clientHeight}|${shown
-            .map((detection) => `${detection.label}:${Object.values(detection.box).map((value) => Math.round(value / 10)).join(",")}`)
-            .join(";")}`;
+            .map((detection) => `${detection.label}:${boxKey(detection.box)}`)
+            .join(";")}|${tracks.map((track) => `${track.itemId}:${boxKey(track.box)}`).join(";")}`;
           if (overlayKey === lastOverlayKey) return;
           lastOverlayKey = overlayKey;
           setLiveDetections({
             detections: shown,
+            tracks,
             width: video.videoWidth,
             height: video.videoHeight,
             // With "slice" (object-fit: cover) one CSS pixel is this many video pixels.
@@ -698,6 +783,38 @@ export default function App({ children }: { children?: React.ReactNode }) {
     return () => {
       cancelled = true;
       window.cancelAnimationFrame(frameRequest);
+    };
+  }, [detectorActive]);
+
+  useEffect(() => {
+    if (!detectorActive) {
+      latestBarcodesRef.current = { codes: [], at: 0 };
+      return;
+    }
+    let cancelled = false;
+    let busy = false;
+    let timer = 0;
+    loadBarcodeReader()
+      .then((reader) => {
+        if (cancelled) return;
+        timer = window.setInterval(() => {
+          const video = videoRef.current;
+          if (busy || !video || video.readyState < 2) return;
+          busy = true;
+          readBarcodes(reader, video)
+            .then((codes) => {
+              if (codes.length > 0) latestBarcodesRef.current = { codes, at: performance.now() };
+            })
+            .catch(() => undefined)
+            .finally(() => {
+              busy = false;
+            });
+        }, BARCODE_INTERVAL_MS);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, [detectorActive]);
 
@@ -753,6 +870,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
   };
 
   return (
+    <OfferTargetsContext.Provider value={offerTargets}>
     <div className={`app-shell ${view === "scan" ? "scan-shell" : "history-shell"}`}>
       {view === "scan" ? (
         <main className="immersive-scan">
@@ -763,13 +881,12 @@ export default function App({ children }: { children?: React.ReactNode }) {
                 className="detection-overlay"
                 viewBox={`0 0 ${liveDetections.width} ${liveDetections.height}`}
                 preserveAspectRatio="xMidYMid slice"
-                aria-hidden="true"
               >
                 {liveDetections.detections.map((detection, index) => {
                   const x = (detection.box.xMin / 1000) * liveDetections.width;
                   const y = (detection.box.yMin / 1000) * liveDetections.height;
                   return (
-                    <g key={`${detection.label}-${index}`}>
+                    <g key={`${detection.label}-${index}`} aria-hidden="true">
                       <rect
                         x={x}
                         y={y}
@@ -779,6 +896,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
                         vectorEffect="non-scaling-stroke"
                       />
                       <text
+                        className="detector-label"
                         x={x + 6 * liveDetections.unitsPerPixel}
                         y={y + 18 * liveDetections.unitsPerPixel}
                         fontSize={14 * liveDetections.unitsPerPixel}
@@ -786,6 +904,34 @@ export default function App({ children }: { children?: React.ReactNode }) {
                       >
                         {detection.label}
                       </text>
+                    </g>
+                  );
+                })}
+                {liveDetections.tracks.map((track) => {
+                  const item = liveItems.find((candidate) => candidate.id === track.itemId);
+                  if (!item) return null;
+                  const unit = liveDetections.unitsPerPixel;
+                  const text = `${item.name.length > 24 ? `${item.name.slice(0, 23)}…` : item.name} · ${formatRange(item)}`;
+                  // Approximate text width; the label is kept inside the right edge of the frame.
+                  const labelWidth = Math.min((text.length * 7.4 + 16) * unit, liveDetections.width);
+                  const x = Math.min((track.box.xMin / 1000) * liveDetections.width, liveDetections.width - labelWidth);
+                  const y = Math.max(0, (track.box.yMin / 1000) * liveDetections.height - 30 * unit);
+                  return (
+                    <g
+                      key={`track-${track.itemId}`}
+                      className={`price-label ${item.pricingStatus}`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${item.name}, ${formatRange(item)}. Open details.`}
+                      onClick={() => openItem(item, "scan")}
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter" && event.key !== " ") return;
+                        event.preventDefault();
+                        openItem(item, "scan");
+                      }}
+                    >
+                      <rect x={x} y={y} width={labelWidth} height={26 * unit} rx={13 * unit} />
+                      <text x={x + 8 * unit} y={y + 18 * unit} fontSize={13 * unit}>{text}</text>
                     </g>
                   );
                 })}
@@ -1006,6 +1152,49 @@ export default function App({ children }: { children?: React.ReactNode }) {
                   {findCriteria && <button type="button" onClick={() => updateFindCriteria("")}>Clear</button>}
                 </div>
               </div>
+              <div className="settings-range">
+                <label htmlFor="market">
+                  <span>Market and currency</span>
+                </label>
+                <select id="market" className="settings-select" value={market} onChange={(event) => setMarket(event.target.value as Market)}>
+                  {(Object.keys(MARKETS) as Market[]).map((key) => (
+                    <option key={key} value={key}>{MARKETS[key].label}</option>
+                  ))}
+                </select>
+                <small className="settings-hint">New finds are priced in this currency with {MARKETS[market].carrier} shipping and local platform fees. Saved finds keep their currency.</small>
+              </div>
+              <div className="settings-range">
+                <label htmlFor="min-profit">
+                  <span>Minimum profit to buy</span>
+                  <strong>{money(offerTargets.minProfitCents, MARKETS[market].currency)}</strong>
+                </label>
+                <input
+                  id="min-profit"
+                  type="range"
+                  min="0"
+                  max="10000"
+                  step="100"
+                  value={offerTargets.minProfitCents}
+                  onChange={(event) => setOfferTargets((current) => ({ ...current, minProfitCents: Number(event.target.value) }))}
+                />
+                <div><span>{money(0, MARKETS[market].currency)}</span><span>{money(10_000, MARKETS[market].currency)}</span></div>
+              </div>
+              <div className="settings-range">
+                <label htmlFor="min-roi">
+                  <span>Minimum ROI to buy</span>
+                  <strong>{Math.round(offerTargets.minRoi * 100)}%</strong>
+                </label>
+                <input
+                  id="min-roi"
+                  type="range"
+                  min="0"
+                  max="5"
+                  step="0.25"
+                  value={offerTargets.minRoi}
+                  onChange={(event) => setOfferTargets((current) => ({ ...current, minRoi: Number(event.target.value) }))}
+                />
+                <div><span>0%</span><span>500%</span></div>
+              </div>
               <label className="settings-toggle">
                 <input
                   type="checkbox"
@@ -1015,7 +1204,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
                 <span>
                   <strong>On-device detection</strong>
                   <small>
-                    Finds objects in the browser and skips live frames with nothing new in view.
+                    Finds objects and barcodes in the browser, shows live price labels, and skips live frames with nothing new in view.
                     {detectorStatus === "loading" && " Loading model…"}
                     {detectorStatus === "failed" && " The model could not load, so every frame is sent."}
                   </small>
@@ -1127,6 +1316,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
       )}
       {children}
     </div>
+    </OfferTargetsContext.Provider>
   );
 }
 
@@ -1208,6 +1398,7 @@ function ItemCard({
         </div>
         <div className="card-badges">
           <PricingBadge item={item} />
+          <OfferBadge item={item} />
           <OnlineBadge item={item} />
           {item.observedPriceCents !== null && <span className="tag-price">Tag {money(item.observedPriceCents, item.currency)}</span>}
         </div>
@@ -1363,8 +1554,9 @@ function ItemDetail({
                 <PricingPathPanel item={item} />
                 <p>{item.valueSummary}</p>
               </div>
+              <OfferPanel item={item} />
               <PriceBreakdown item={item} />
-              <OnlineOutlookPanel item={item} />
+              <SaleOptionsPanel item={item} />
               <a
                 className="lens-search-link"
                 data-export-exclude
@@ -1376,20 +1568,35 @@ function ItemDetail({
               </a>
               {marketEvidence.length > 0 && (
                 <section className="comparables">
-                  <h3>Sold comps & web results</h3>
+                  <h3>Comps</h3>
+                  <CompStatsSummary item={item} />
                   {marketEvidence.map((comparable, index) => {
+                    const poorMatch = comparable.matchScore != null && comparable.matchScore < MIN_MATCH_SCORE;
+                    const details = [
+                      comparable.source,
+                      comparable.condition,
+                      comparable.soldAt ? `sold ${new Date(comparable.soldAt).toLocaleDateString()}` : null,
+                      comparable.matchScore != null ? `${Math.round(comparable.matchScore * 100)}% match` : null,
+                      comparable.originalCurrency && comparable.originalPriceCents != null
+                        ? `from ${money(comparable.originalPriceCents, comparable.originalCurrency)}`
+                        : null,
+                    ].filter(Boolean);
                     const content = (
                       <>
                         <span className={`comp-type ${comparable.type}`}>{comparable.type}</span>
-                        <span>{comparable.title}</span>
+                        <span className="comp-title">
+                          {comparable.title}
+                          {details.length > 0 && <small>{details.join(" · ")}</small>}
+                        </span>
                         <strong>{comparable.priceCents === null ? "—" : money(comparable.priceCents, comparable.currency)}</strong>
                         {comparable.url && <ExternalLink size={15} />}
                       </>
                     );
+                    const className = poorMatch ? "poor-match" : undefined;
                     return comparable.url ? (
-                      <a key={`${comparable.title}-${index}`} href={comparable.url} target="_blank" rel="noreferrer">{content}</a>
+                      <a key={`${comparable.title}-${index}`} className={className} href={comparable.url} target="_blank" rel="noreferrer">{content}</a>
                     ) : (
-                      <div key={`${comparable.title}-${index}`}>{content}</div>
+                      <div key={`${comparable.title}-${index}`} className={className}>{content}</div>
                     );
                   })}
                 </section>
@@ -1399,6 +1606,8 @@ function ItemDetail({
                 <div><dt>Model</dt><dd>{item.model ?? "Unknown"}</dd></div>
                 <div><dt>Condition</dt><dd>{item.condition}</dd></div>
                 <div><dt>Category</dt><dd>{item.category}</dd></div>
+                {item.barcode && <div><dt>Barcode</dt><dd>{item.barcode}</dd></div>}
+                {item.vintage && <div><dt>Age</dt><dd>Vintage (20+ years)</dd></div>}
                 <div><dt>Seen</dt><dd>{item.seenCount} time{item.seenCount === 1 ? "" : "s"}</dd></div>
                 <div><dt>First seen</dt><dd>{new Date(item.firstSeenAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}</dd></div>
               </dl>
@@ -1596,9 +1805,86 @@ function PricingBadge({ item }: { item: DetectedItem }) {
 }
 
 function OnlineBadge({ item }: { item: DetectedItem }) {
-  const outlook = onlineOutlook(item);
-  if (!outlook || outlook.verdict !== "online") return null;
-  return <span className="online-badge"><Globe size={10} /> +{money(outlook.premiumCents, item.currency)} online</span>;
+  const outlook = saleOutlook(item);
+  if (outlook.verdict !== "online" || outlook.premiumCents === null || !outlook.bestOnline) return null;
+  return (
+    <span className="online-badge">
+      <Globe size={10} /> +{money(outlook.premiumCents, item.currency)} on {outlook.bestOnline.platform.name}
+    </span>
+  );
+}
+
+function useOfferAdvice(item: DetectedItem) {
+  const targets = useContext(OfferTargetsContext);
+  const best = saleOutlook(item).best;
+  if (!best || best.netCents === null) return null;
+  return { advice: offerAdvice(item.observedPriceCents, best.netCents, targets), best };
+}
+
+function OfferBadge({ item }: { item: DetectedItem }) {
+  const result = useOfferAdvice(item);
+  if (!result || item.pricingStatus === "researching") return null;
+  const { advice } = result;
+  const label =
+    advice.verdict === "offer" ? `Max ${money(advice.maxOfferCents, item.currency)}` : advice.verdict[0]!.toUpperCase() + advice.verdict.slice(1);
+  return <span className={`offer-badge ${advice.verdict}`}>{label}</span>;
+}
+
+function OfferPanel({ item }: { item: DetectedItem }) {
+  const targets = useContext(OfferTargetsContext);
+  const result = useOfferAdvice(item);
+  if (!result) return null;
+  const { advice, best } = result;
+  const maxOffer = money(advice.maxOfferCents, item.currency);
+  const headline = {
+    buy: "Buy",
+    negotiate: `Negotiate: offer ${maxOffer} or less`,
+    pass: "Pass",
+    offer: advice.maxOfferCents > 0 ? `Pay up to ${maxOffer}` : "Not worth reselling",
+  }[advice.verdict];
+  const targetText = `your targets of ${money(targets.minProfitCents, item.currency)} profit and ${Math.round(targets.minRoi * 100)}% ROI`;
+
+  return (
+    <section className={`offer-panel ${advice.verdict}`}>
+      <strong>{headline}</strong>
+      <span>
+        {advice.maxOfferCents > 0
+          ? `The most to pay is ${maxOffer}, to meet ${targetText}.`
+          : `It cannot meet ${targetText}.`}{" "}
+        Expected net: {money(advice.expectedNetCents, item.currency)} ({best.platform.name}).
+        {item.pricingStatus === "researching" && " Research is still running, so this can change."}
+      </span>
+    </section>
+  );
+}
+
+function CompStatsSummary({ item }: { item: DetectedItem }) {
+  const stats = compStats(item.comparables, item.currency);
+  const row = (label: string, value: PriceStats | null) =>
+    value && (
+      <div>
+        <dt>{label}</dt>
+        <dd>
+          <strong>{money(value.medianCents, item.currency)}</strong> median · {value.count} comp{value.count === 1 ? "" : "s"}
+          {value.count > 1 && ` · ${money(value.lowCents, item.currency)}–${money(value.highCents, item.currency)}`}
+          {value.excluded > 0 && ` · ${value.excluded} left out`}
+        </dd>
+      </div>
+    );
+  if (stats.confidence === "none") return null;
+  return (
+    <dl className={`comp-stats ${stats.confidence}`}>
+      {row("Sold", stats.sold)}
+      {row("Listed", stats.active)}
+      {row("Retail", stats.retail)}
+      <div>
+        <dt>Evidence</dt>
+        <dd>
+          {{ high: "Strong: 5 or more sold comps", medium: "Fair: a few sold comps or many listings", low: "Weak: very few comps" }[stats.confidence]}
+        </dd>
+      </div>
+    </dl>
+  );
 }
 
 function PricingPathPanel({ item }: { item: DetectedItem }) {
@@ -1653,8 +1939,6 @@ function PriceBreakdown({ item }: { item: DetectedItem }) {
       tone: margin.profitCents > 0 ? "good" : "bad",
     });
   }
-  if (item.soldPriceCents !== null) rows.push({ label: "Sold online", value: money(item.soldPriceCents, item.currency) });
-  if (item.activePriceCents !== null) rows.push({ label: "Listed online", value: money(item.activePriceCents, item.currency) });
   if (item.retailPriceCents !== null) {
     const local = localResaleCents(item);
     if (local !== null && item.retailPriceCents > 0) {
@@ -1675,38 +1959,48 @@ function PriceBreakdown({ item }: { item: DetectedItem }) {
   );
 }
 
-function OnlineOutlookPanel({ item }: { item: DetectedItem }) {
-  const outlook = onlineOutlook(item);
-  if (!outlook) {
+function SaleOptionsPanel({ item }: { item: DetectedItem }) {
+  const outlook = saleOutlook(item);
+  const researching = item.pricingStatus === "researching" ? " Research is still running." : "";
+  if (outlook.options.length === 0) {
     return (
       <section className="online-outlook unknown">
-        <h3><Globe size={16} /> Online or local?</h3>
-        <p>Not enough online price evidence to compare.{item.pricingStatus === "researching" ? " Research is still running." : ""}</p>
+        <h3><Globe size={16} /> Where to sell</h3>
+        <p>Not enough price evidence to compare.{researching}</p>
       </section>
     );
   }
 
+  const premium = outlook.premiumCents;
   const headline =
-    outlook.verdict === "online"
-      ? `Sells for about ${money(outlook.premiumCents, item.currency)} more online`
+    outlook.verdict === "online" && outlook.bestOnline && premium !== null
+      ? `Sells for about ${money(premium, item.currency)} more on ${outlook.bestOnline.platform.name}`
       : outlook.verdict === "local"
         ? "Sell locally. Online nets less after fees and shipping."
-        : `About the same online (${outlook.premiumCents >= 0 ? "+" : "−"}${money(Math.abs(outlook.premiumCents), item.currency)})`;
-  const feePercent = (MARKETPLACE_FEE_RATE * 100).toFixed(2).replace(/\.?0+$/, "");
+        : outlook.verdict === "similar" && premium !== null
+          ? `About the same online (${premium >= 0 ? "+" : "−"}${money(Math.abs(premium), item.currency)})`
+          : `Online comparison needs a shipping estimate.${researching}`;
 
   return (
-    <section className={`online-outlook ${outlook.verdict}`}>
+    <section className={`online-outlook ${outlook.verdict ?? "unknown"}`}>
       <h3>{outlook.verdict === "local" ? <Store size={16} /> : <Globe size={16} />} {headline}</h3>
-      <dl>
-        <div><dt>Online sale</dt><dd>{money(outlook.onlineSaleCents, item.currency)}</dd></div>
-        <div>
-          <dt>Fees ({feePercent}% + {money(MARKETPLACE_FIXED_FEE_CENTS, item.currency)})</dt>
-          <dd>−{money(outlook.feesCents, item.currency)}</dd>
-        </div>
-        <div><dt>Shipping{item.shippingCents === null ? " (unknown)" : ""}</dt><dd>−{money(outlook.shippingCents, item.currency)}</dd></div>
-        <div className="total"><dt>Online net</dt><dd>{money(outlook.onlineNetCents, item.currency)}</dd></div>
-        <div className="total"><dt>Local sale</dt><dd>{money(outlook.localCents, item.currency)}</dd></div>
-      </dl>
+      <table className="platform-table">
+        <thead>
+          <tr><th>Platform</th><th>Sale</th><th>Fees</th><th>Ship</th><th>Net</th></tr>
+        </thead>
+        <tbody>
+          {outlook.options.map((option) => (
+            <tr key={option.platform.id} className={option === outlook.best ? "best" : undefined} title={option.platform.feeSummary}>
+              <td>{option.platform.name}</td>
+              <td>{money(option.saleCents, item.currency)}</td>
+              <td>−{money(option.feesCents, item.currency)}</td>
+              <td>{option.shippingCents === null ? "?" : option.shippingCents === 0 ? "—" : `−${money(option.shippingCents, item.currency)}`}</td>
+              <td>{option.netCents === null ? "?" : money(option.netCents, item.currency)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p>Fees are the most common category rates. Shipping is an estimate for a seller-paid domestic label.</p>
     </section>
   );
 }
@@ -1720,19 +2014,14 @@ function formatRange(item: DetectedItem): string {
 }
 
 function collectMarketEvidence(item: DetectedItem) {
-  const evidence: Array<{
-    title: string;
-    url: string | null;
-    priceCents: number | null;
-    currency: string;
-    type: "retail" | "active" | "sold" | "web";
-  }> = item.comparables.map((comparable) => ({ ...comparable }));
+  const evidence: Array<Omit<Comparable, "type"> & { type: Comparable["type"] | "web" }> =
+    item.comparables.map((comparable) => ({ ...comparable }));
   const knownUrls = new Set(evidence.map((entry) => entry.url).filter(Boolean));
   const markdownLink = /\[([^\]]+)]\((https?:\/\/[^)]+)\)/g;
   for (const match of item.valueSummary.matchAll(markdownLink)) {
     const [, title, url] = match;
     if (!url || knownUrls.has(url)) continue;
-    evidence.push({ title: title || "Web result", url, priceCents: null, currency: item.currency, type: "web" });
+    evidence.push({ title: title || "Web result", url, priceCents: null, currency: item.currency, type: "web", source: "web" });
     knownUrls.add(url);
   }
   return evidence;
@@ -1742,7 +2031,8 @@ function money(cents: number, currency: string): string {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: currency || "USD",
-    currencyDisplay: "narrowSymbol",
+    // "$" alone is ambiguous between US and Canadian dollars, so only USD uses the narrow symbol.
+    currencyDisplay: (currency || "USD") === "USD" ? "narrowSymbol" : "symbol",
     maximumFractionDigits: cents % 100 === 0 ? 0 : 2,
   }).format(cents / 100);
 }

@@ -9,9 +9,19 @@ export type Stats = {
 export type Comparable = {
   title: string;
   url: string | null;
+  /** Price in `currency`. Converted from the source currency when needed. */
   priceCents: number | null;
   currency: string;
   type: "retail" | "active" | "sold";
+  /** Where the comp came from, for example "ebay", "pricecharting", "discogs", or "web". */
+  source?: string | null;
+  soldAt?: string | null;
+  condition?: string | null;
+  shippingCents?: number | null;
+  /** Probability (0–1) that this comp is the same item in a comparable condition. */
+  matchScore?: number | null;
+  originalPriceCents?: number | null;
+  originalCurrency?: string | null;
 };
 
 export type BoundingBox = {
@@ -20,6 +30,9 @@ export type BoundingBox = {
   xMax: number;
   yMax: number;
 };
+
+export type Market = "US" | "CA";
+export type GoodsType = "fashion" | "media" | "electronics" | "collectible" | "home" | "tools" | "toys" | "other";
 
 export type PricingPath = "instant" | "research";
 export type PricingStatus = "priced" | "researching" | "research_failed";
@@ -45,6 +58,11 @@ export type DetectedItem = {
   soldPriceCents: number | null;
   onlineSaleCents: number | null;
   shippingCents: number | null;
+  goodsType: GoodsType;
+  /** At least 20 years old, which makes it eligible for Etsy's vintage category. */
+  vintage: boolean;
+  /** UPC, EAN, or ISBN read from the item, when one was visible. */
+  barcode: string | null;
   valueSummary: string;
   pricingPath: PricingPath;
   pricingStatus: PricingStatus;
@@ -69,6 +87,13 @@ export type DeviceDetection = {
   label: string;
   score: number;
   box: BoundingBox;
+};
+
+export type DeviceBarcode = {
+  /** Digits only: UPC-A, EAN-13, EAN-8, or ISBN-13. */
+  value: string;
+  format: string;
+  box: BoundingBox | null;
 };
 
 /** One line of the NDJSON stream returned by POST /api/analyze. */

@@ -4,9 +4,10 @@ This file tracks intentionally deferred product ideas so the MVP can stay focuse
 
 ## Planned
 
-- **Live-feed bounding-box tracking:** Match on-device detections to saved finds so their prices follow the object on the moving camera feed.
 - **Natural-language discovery filters:** Let the scanner prompt Luna with filters such as “only show me band T-shirts valued over $50.” Keep capturing activity metrics even when a detected item is filtered from the visible feed.
-- **eBay sold-comps integration:** Add an eBay MCP server or eBay developer API tool when credentials are available. Prefer sold listings and retain links and timestamps for each comparable.
+- **eBay sold-comps integration:** eBay's Marketplace Insights API (sold listings) is limited to approved partners. Add it if access is granted.
+- **Carrier shipping rates:** Replace model shipping estimates with USPS and Canada Post rate APIs by size and weight.
+- **Open-vocabulary detection:** COCO does not detect clothing, records, or tools, so live labels and frame skipping miss them.
 - **Configurable alert rules:** Filter by category, value, estimated profit, ROI, brand, condition, or confidence.
 - **Batch processing mode:** Use the OpenAI Batch API for non-live uploaded footage where throughput and cost matter more than immediate results. Live camera analysis should continue using concurrent low-latency requests.
 - **Visual similarity deduplication:** Add embeddings or image-feature matching so duplicate detection is not limited to normalized semantic fingerprints.
@@ -28,4 +29,5 @@ This file tracks intentionally deferred product ideas so the MVP can stay focuse
 - Luna returns normalized item coordinates; saved-frame thumbnails and detail views render item-level bounding boxes.
 - Two-stage pricing: quick prices first, web research only for items that need it. Jev (optional) or Luna decides.
 - On-device MediaPipe detection draws live boxes and skips live frames with nothing new in view.
-- The detail sheet shows the pricing path, tag profit and ROI, sold and listed prices, and an online-versus-local verdict.
+- The detail sheet shows the pricing path, tag profit and ROI, comp statistics, platform nets, and a buy / negotiate / pass verdict.
+- US and Canada markets, barcode lookups, PriceCharting and Discogs comps, and live price labels.

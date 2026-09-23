@@ -7,8 +7,10 @@ import type {
   AnalysisEvent,
   Comparable,
   DetectedItem,
+  DeviceBarcode,
   DeviceDetection,
   HistoryPage,
+  Market,
   Stats,
 } from "../src/types";
 import { HISTORY_PAGE_SIZE, HistoryQueryError, historyQuery } from "./history";
@@ -24,6 +26,9 @@ import { appStats, frameRuns, items, scanSessions, valuationSources } from "./db
 import { fingerprintSimilarity, normalizeFingerprint } from "./normalize";
 import { type TriageDecision, type TriageRun, triageItems } from "./triage";
 import { isResearchStale, keepsExistingPricing } from "./research";
+import { isValidBarcode, lookupBarcode } from "./comps/identity";
+import { finalizeComps, MAX_COMPS_PER_ITEM, pricesFromStats, specialistComps } from "./comps/pipeline";
+import { MARKET_CONFIG } from "./comps/types";
 
 const MAX_FRAME_BYTES = 2_500_000;
 
@@ -142,6 +147,11 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
   }
   const findCriteria = (findCriteriaValue ?? "").slice(0, 1000);
   const deviceDetections = parseDeviceDetections(form.get("deviceDetections"));
+  const market: Market = form.get("market") === "CA" ? "CA" : "US";
+  const currency = MARKET_CONFIG[market].currency;
+  const barcodes = parseBarcodes(form.get("barcodes"));
+  // Barcode identity lookups run while Luna identifies the frame; research uses the results.
+  const barcodeIdentities = Promise.all(barcodes.map((barcode) => lookupBarcode(barcode.value)));
 
   const capturedAt =
     typeof capturedAtValue === "string" && !Number.isNaN(Date.parse(capturedAtValue))
@@ -186,6 +196,8 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
         sessionId,
         findCriteria,
         deviceDetections,
+        market,
+        barcodes,
       });
       modelCalls += identified.modelCalls;
       searchesPerformed += identified.searchesPerformed;
@@ -210,6 +222,7 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
           sessionId,
           thumbnailKey,
           capturedAt,
+          currency,
         });
         if (saved) savedRows.set(saved.row.id, saved);
       }
@@ -221,17 +234,37 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
       const toResearch = [...savedRows.values()].filter((saved) => saved.needsResearch);
       let research: Awaited<ReturnType<typeof researchItems>> | null = null;
       let researchError: string | null = null;
+      const compsAudit: Array<{ item: string; comps: number; matchSource: string | null; errors: string[] }> = [];
       if (toResearch.length > 0) {
+        const ebayCredentials =
+          env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
+            ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
+            : undefined;
+        const matchItems = toResearch.map((saved) => ({ ...saved.candidate, barcode: saved.row.barcode }));
+        const toolComps = matchItems.map(() => [] as Comparable[]);
+        let toolCompsClosed = false;
+        // Exact-product lookups need no model, so they run next to the research agent.
+        const frameBase64 = identified.output.length === 1 ? imageDataUrl.slice(imageDataUrl.indexOf(",") + 1) : null;
+        const specialist = Promise.all(matchItems.map((item) =>
+          specialistComps(item, market, {
+            priceChartingToken: env.PRICECHARTING_TOKEN || undefined,
+            discogsToken: env.DISCOGS_TOKEN || undefined,
+            ebayCredentials,
+          }, frameBase64),
+        ));
         try {
           research = await researchItems({
             apiKey: env.OPENAI_API_KEY,
             model: env.OPENAI_MODEL,
             imageDataUrl,
-            items: toResearch.map((saved) => saved.candidate),
-            ebayCredentials:
-              env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET
-                ? { clientId: env.EBAY_CLIENT_ID, clientSecret: env.EBAY_CLIENT_SECRET }
-                : undefined,
+            items: toResearch.map((saved) => ({ ...saved.candidate, barcode: saved.row.barcode, currency })),
+            market,
+            barcodeIdentities: await barcodeIdentities,
+            ebayCredentials,
+            onComps: (index, comps) => {
+              // A tool call still running after research failed must not change comps being finalized.
+              if (!toolCompsClosed) toolComps[index]?.push(...comps);
+            },
           });
           modelCalls += research.modelCalls;
           searchesPerformed += research.searchesPerformed;
@@ -239,21 +272,35 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
           researchError = error instanceof Error ? error.message : "Research failed";
           console.error(JSON.stringify({ message: "item research failed", frameId, error: researchError }));
         }
+        const specialistResults = await specialist;
+        toolCompsClosed = true;
 
         const researchedAt = new Date().toISOString();
         const updatedRows: Array<typeof items.$inferSelect> = [];
         for (const [index, saved] of toResearch.entries()) {
           const valuation = research?.output.find((candidate) => candidate.index === index);
+          const { comps, stats, matchSource } = await finalizeComps({
+            item: matchItems[index]!,
+            market,
+            providerComps: [...toolComps[index]!, ...specialistResults[index]!.comps],
+            modelComps: (valuation?.comparables ?? []).map((comparable) => ({ ...comparable, source: null })),
+            jevApiKey: env.TYPESAFE_API_KEY || undefined,
+          });
+          compsAudit.push({ item: saved.candidate.name, comps: comps.length, matchSource, errors: specialistResults[index]!.errors });
+          const prices = pricesFromStats(stats, {
+            soldPriceCents: valuation?.soldPriceCents ?? saved.row.soldPriceCents,
+            activePriceCents: valuation?.activePriceCents ?? saved.row.activePriceCents,
+            onlineSaleCents: valuation?.onlineSaleCents ?? saved.row.onlineSaleCents,
+            retailPriceCents: valuation?.retailPriceCents ?? saved.row.retailPriceCents,
+          });
+          // Comps found by code still improve the price when the research model failed.
           const [updated] = valuation
             ? await db
                 .update(items)
                 .set({
+                  ...prices,
                   estimatedLowCents: valuation.estimatedLowCents,
                   estimatedHighCents: valuation.estimatedHighCents,
-                  retailPriceCents: valuation.retailPriceCents,
-                  activePriceCents: valuation.activePriceCents,
-                  soldPriceCents: valuation.soldPriceCents,
-                  onlineSaleCents: valuation.onlineSaleCents,
                   shippingCents: valuation.shippingCents,
                   valueSummary: valuation.valueSummary,
                   pricingPath: "research",
@@ -264,23 +311,36 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
                 .returning()
             : await db
                 .update(items)
-                .set({ pricingStatus: "research_failed" })
+                .set({ ...prices, pricingStatus: "research_failed" })
                 .where(ownsResearch(saved.row))
                 .returning();
           if (!updated) continue;
           updatedRows.push(updated);
-          if (valuation && valuation.comparables.length > 0) {
-            await db.insert(valuationSources).values(valuation.comparables.map((comparable) => ({
-              id: crypto.randomUUID(),
-              itemId: updated.id,
-              sourceType: comparable.type,
-              title: comparable.title,
-              url: comparable.url,
-              priceCents: comparable.priceCents,
-              currency: comparable.currency,
-              capturedAt,
-            })));
+          // The consolidated list replaces older comps, so repeated research does not pile up duplicates.
+          const rows = comps.map((comparable) => ({
+            id: crypto.randomUUID(),
+            itemId: updated.id,
+            sourceType: comparable.type,
+            title: comparable.title.slice(0, 500),
+            url: comparable.url,
+            priceCents: comparable.priceCents,
+            currency: comparable.currency,
+            source: comparable.source ?? null,
+            soldAt: comparable.soldAt ?? null,
+            condition: comparable.condition ?? null,
+            shippingCents: comparable.shippingCents ?? null,
+            matchScore: comparable.matchScore ?? null,
+            originalPriceCents: comparable.originalPriceCents ?? null,
+            originalCurrency: comparable.originalCurrency ?? null,
+            capturedAt,
+          }));
+          // D1 allows 100 bound parameters per statement, so insert a few rows at a time in one batch.
+          const rowsPerInsert = Math.floor(100 / Object.keys(rows[0] ?? { id: "" }).length);
+          const inserts = [];
+          for (let start = 0; start < rows.length; start += rowsPerInsert) {
+            inserts.push(db.insert(valuationSources).values(rows.slice(start, start + rowsPerInsert)));
           }
+          await db.batch([db.delete(valuationSources).where(eq(valuationSources.itemId, updated.id)), ...inserts]);
         }
         const researchedItems = await hydrateItems(env, updatedRows);
         for (const item of researchedItems) item.duplicate = savedRows.get(item.id)?.duplicate ?? item.duplicate;
@@ -302,7 +362,7 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
       }
 
       const latencyMs = Date.now() - started;
-      const audit = combineAudits(identified.audit, triage, research?.audit ?? null, researchError);
+      const audit = combineAudits(identified.audit, triage, research?.audit ?? null, researchError, compsAudit);
       await db.insert(frameRuns).values({
         id: frameId,
         scanSessionId: sessionId,
@@ -363,7 +423,7 @@ async function analyzeRequest(request: Request, env: Env, ctx: ExecutionContext)
             inputJson: JSON.stringify({
               role: "user",
               content: [
-                { type: "input_text", text: buildAgentInputText(findCriteria, deviceDetections) },
+                { type: "input_text", text: buildAgentInputText(findCriteria, deviceDetections, market, barcodes) },
                 { type: "input_image", image: "[frame stored in R2]", detail: "high" },
               ],
             }),
@@ -404,6 +464,8 @@ async function saveIdentifiedItem(
     sessionId: string;
     thumbnailKey: string;
     capturedAt: string;
+    /** The market currency; every price for a new find is in this currency. */
+    currency: string;
   },
 ): Promise<SavedItem | null> {
   const { candidate, decision, knownFingerprints, capturedAt } = options;
@@ -431,7 +493,10 @@ async function saveIdentifiedItem(
     condition: candidate.condition,
     confidence: candidate.confidence,
     observedPriceCents: candidate.observedPriceCents,
-    currency: candidate.currency,
+    currency: options.currency,
+    goodsType: candidate.goodsType,
+    vintage: candidate.vintage,
+    barcode: candidate.barcode && isValidBarcode(candidate.barcode) ? candidate.barcode.replace(/\D/g, "") : null,
     thumbnailKey: options.thumbnailKey,
     boxXMin: candidate.boundingBox.xMin,
     boxYMin: candidate.boundingBox.yMin,
@@ -440,6 +505,7 @@ async function saveIdentifiedItem(
     rawJson: JSON.stringify(candidate),
     lastSeenAt: capturedAt,
   };
+  const { currency: _newCurrency, ...identityUpdate } = identity;
   const pricing = {
     estimatedLowCents: candidate.quickLowCents,
     estimatedHighCents: candidate.quickHighCents,
@@ -474,7 +540,7 @@ async function saveIdentifiedItem(
     })
     .onConflictDoUpdate({
       target: items.fingerprint,
-      set: { ...identity, seenCount: sql`${items.seenCount} + 1` },
+      set: { ...identityUpdate, seenCount: sql`${items.seenCount} + 1` },
     })
     .returning();
   if (!upserted) throw new Error("D1 did not return the saved item.");
@@ -484,7 +550,9 @@ async function saveIdentifiedItem(
     return { row: upserted, candidate, duplicate, needsResearch: upserted.pricingStatus === "researching" };
   }
 
-  if (keepsExistingPricing(upserted, decision, capturedAt)) {
+  // A saved find keeps the currency it was priced in. Seen again in another market, it keeps its
+  // prices and comps, so ledger amounts and comps never change currency.
+  if (upserted.currency !== options.currency || keepsExistingPricing(upserted, decision, capturedAt)) {
     return { row: upserted, candidate, duplicate, needsResearch: false };
   }
   // Claim the row: the new pricing applies only if nobody changed the pricing state since the
@@ -522,6 +590,7 @@ function combineAudits(
   triage: TriageRun,
   research: AgentRunAudit | null,
   researchError: string | null,
+  compsAudit: unknown[] = [],
 ): AgentRunAudit {
   const events = [
     ...identify.events.map((event) => ({ ...event, title: `Identify · ${event.title}` })),
@@ -532,6 +601,7 @@ function combineAudits(
       data: triage,
     },
     ...(research?.events ?? []).map((event) => ({ ...event, title: `Research · ${event.title}` })),
+    ...(compsAudit.length > 0 ? [{ sequence: 0, type: "comps", title: "Comps · Matched and priced", data: compsAudit }] : []),
     ...(researchError ? [{ sequence: 0, type: "error", title: "Research · Failed", data: { error: researchError } }] : []),
   ].map((event, sequence) => ({ ...event, sequence }));
 
@@ -571,6 +641,36 @@ function parseDeviceDetections(value: ReturnType<FormData["get"]>): DeviceDetect
           yMax: clampCoordinate(entry.box.yMax),
         },
       }));
+  } catch {
+    return [];
+  }
+}
+
+function parseBarcodes(value: ReturnType<FormData["get"]>): DeviceBarcode[] {
+  if (typeof value !== "string" || !value) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((entry): entry is { value: string; format?: unknown; box?: unknown } => isRecord(entry) && typeof entry.value === "string")
+      .map((entry) => ({ ...entry, value: entry.value.replace(/\D/g, "") }))
+      .filter((entry) => isValidBarcode(entry.value))
+      .slice(0, 5)
+      .map((entry) => {
+        const box = isRecord(entry.box) && ["xMin", "yMin", "xMax", "yMax"].every((key) => typeof (entry.box as Record<string, unknown>)[key] === "number")
+          ? (entry.box as DeviceBarcode["box"] & object)
+          : null;
+        return {
+          value: entry.value,
+          format: typeof entry.format === "string" ? entry.format.slice(0, 20) : "unknown",
+          box: box && {
+            xMin: clampCoordinate(box.xMin),
+            yMin: clampCoordinate(box.yMin),
+            xMax: clampCoordinate(box.xMax),
+            yMax: clampCoordinate(box.yMax),
+          },
+        };
+      });
   } catch {
     return [];
   }
@@ -702,17 +802,24 @@ async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): P
           .select()
           .from(valuationSources)
           .where(inArray(valuationSources.itemId, ids))
-          .orderBy(desc(valuationSources.capturedAt));
+          .orderBy(desc(valuationSources.capturedAt), desc(sql`coalesce(${valuationSources.matchScore}, 1)`));
   const sourceMap = new Map<string, Comparable[]>();
   for (const source of sources) {
     const comparables = sourceMap.get(source.itemId) ?? [];
-    if (comparables.length < 8) {
+    if (comparables.length < MAX_COMPS_PER_ITEM) {
       comparables.push({
         title: source.title,
         url: source.url,
         priceCents: source.priceCents,
         currency: source.currency,
         type: source.sourceType,
+        source: source.source,
+        soldAt: source.soldAt,
+        condition: source.condition,
+        shippingCents: source.shippingCents,
+        matchScore: source.matchScore,
+        originalPriceCents: source.originalPriceCents,
+        originalCurrency: source.originalCurrency,
       });
       sourceMap.set(source.itemId, comparables);
     }
@@ -738,6 +845,9 @@ async function hydrateItems(env: Env, rows: Array<typeof items.$inferSelect>): P
     soldPriceCents: row.soldPriceCents,
     onlineSaleCents: row.onlineSaleCents,
     shippingCents: row.shippingCents,
+    goodsType: row.goodsType,
+    vintage: row.vintage,
+    barcode: row.barcode,
     valueSummary: row.valueSummary,
     pricingPath: row.pricingPath,
     pricingStatus:

@@ -4,3 +4,10 @@ OPENAI_API_KEY=your_openai_api_key_here
 TYPESAFE_API_KEY=
 # Optional: "auto" (default) prices cheap common items instantly; "research_all" researches every item, as before.
 PRICING_TRIAGE=auto
+# Optional comp sources. Leave empty to skip them.
+EBAY_CLIENT_ID=
+EBAY_CLIENT_SECRET=
+# Paid PriceCharting subscription: sold-based prices for games, cards, comics, LEGO, and Funko.
+PRICECHARTING_TOKEN=
+# Discogs personal access token (free): record and CD listings.
+DISCOGS_TOKEN=

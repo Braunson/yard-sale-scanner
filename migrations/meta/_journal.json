@@ -36,6 +36,13 @@
       "when": 1790186472466,
       "tag": "0004_two_stage_pricing",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790187977629,
+      "tag": "0005_comps_and_markets",
+      "breakpoints": true
     }
   ]
 }

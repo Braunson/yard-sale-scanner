@@ -22,6 +22,10 @@ An installable browser/PWA scanner that samples frames from a live camera or upl
    OPENAI_API_KEY=your_real_project_key
    TYPESAFE_API_KEY=
    PRICING_TRIAGE=auto
+   EBAY_CLIENT_ID=
+   EBAY_CLIENT_SECRET=
+   PRICECHARTING_TOKEN=
+   DISCOGS_TOKEN=
    ```
 
 2. The checked-in `wrangler.jsonc` targets the author's Cloudflare resources and uses remote D1/R2 bindings. For local development, remove `remote: true` from both bindings. Install dependencies and apply local D1 migrations:
@@ -49,9 +53,18 @@ The browser samples compressed frames at a configurable 1–30 second interval a
 | `OPENAI_MODEL` | Yes (set in `wrangler.jsonc`) | `vars` in `wrangler.jsonc` | The model for both agent stages. Default `gpt-5.6-luna`. |
 | `TYPESAFE_API_KEY` | No | `.dev.vars` / `wrangler secret put` | Turns on Jev pricing triage. Empty or missing: Luna's own hint decides. If Jev fails or takes more than 4 s, Luna's hint decides. |
 | `PRICING_TRIAGE` | No | `.dev.vars` / `wrangler secret put` or `vars` | `auto` (default): cheap common items get an instant price and skip web research. `research_all`: every item gets web research, as before two-stage pricing. Jev is not called. |
-| `EBAY_CLIENT_ID`, `EBAY_CLIENT_SECRET` | No | `.dev.vars` / `wrangler secret put` | Adds the eBay active-listing search tool to the research stage. |
+| `EBAY_CLIENT_ID`, `EBAY_CLIENT_SECRET` | No | `.dev.vars` / `wrangler secret put` | eBay Browse API app keys. Adds eBay active-listing search (eBay.com or eBay.ca, from the market) and eBay image search for single-item frames. |
+| `PRICECHARTING_TOKEN` | No | `.dev.vars` / `wrangler secret put` | Paid PriceCharting API token. Adds prices built from completed sales for video games, trading cards, comics, LEGO, and Funko, looked up by barcode or name. |
+| `DISCOGS_TOKEN` | No | `.dev.vars` / `wrangler secret put` | Free Discogs personal access token. Adds the lowest current price and listing count for records, CDs, and other media, looked up by barcode or name. |
 
-Browser settings, kept in `localStorage` on each device: find criteria, concurrent processing, live scan frequency, and **On-device detection** (default on).
+Every comp source is optional. Without any of them, research uses web search and the model's own comps, as before.
+
+Browser settings, kept in `localStorage` on each device:
+
+- **Market and currency:** United States (USD) or Canada (CAD). New finds are priced in this currency, with USPS or Canada Post shipping, and the fees of that country's platforms. Saved finds keep the currency they were priced in.
+- **Minimum profit to buy** (default $10) and **minimum ROI to buy** (default 100%), for the buy / negotiate / pass verdict.
+- **On-device detection** (default on): object detection, barcode reading, live price labels, and frame skipping.
+- Find criteria, concurrent processing, and live scan frequency.
 
 ### Jev is optional
 
@@ -61,7 +74,7 @@ Two-stage pricing is still on without Jev. Luna can mark a generic, low-value it
 
 ## Upgrading from the single-stage version
 
-- **Apply migration `0004_two_stage_pricing.sql`** (`npm run db:migrate:local` or `npm run db:migrate:remote`) before you deploy the new Worker. The migration adds pricing columns to `items`. It also marks existing items as researched, so a new scan does not replace their prices.
+- **Apply migrations `0004_two_stage_pricing.sql` and `0005_comps_and_markets.sql`** (`npm run db:migrate:local` or `npm run db:migrate:remote`) before you deploy the new Worker. The migration adds pricing columns to `items`. It also marks existing items as researched, so a new scan does not replace their prices.
 - **`POST /api/analyze` now returns NDJSON** (`application/x-ndjson`), not one JSON object. See [Analyze stream](#analyze-stream). Scripts that call this endpoint must change.
 - **`npm run cf-typegen` reads `.dev.vars`.** Keep `TYPESAFE_API_KEY` and `PRICING_TRIAGE` in `.dev.vars`, even with empty values. If you do not, the regenerated `worker-configuration.d.ts` does not have them and the Worker does not compile.
 - **Local dev uses HTTP/1.1.** A browser opens only 6 connections to one origin. Research streams stay open after their concurrency slot is released. If you scan fast on `wrangler dev`, new requests can wait. Production on HTTP/2 does not have this problem.
@@ -121,9 +134,52 @@ Validation errors before the stream starts, such as a missing image or a missing
 
 Item pricing fields: `pricingPath` (`instant` | `research`), `pricingStatus` (`priced` | `researching` | `research_failed`), `triageSource` (`jev` | `luna` | `reused` | `config`), `triageConfidence`, `researchReason`, `onlineSaleCents`, and `shippingCents`. If research has not finished 10 minutes after it started, the item is shown as `research_failed` with its quick price.
 
-## Online versus local
+## Comps
 
-The item detail sheet compares a local sale (the midpoint of the resale range) with an online sale after eBay fees (13.25% + $0.40) and seller-paid shipping. It recommends online only when the net gain is at least $5 or 15% of the local price.
+Research collects comps from several sources for each item:
+
+| Source | Type | When |
+| --- | --- | --- |
+| Web search (Luna) | retail, sold, active | Always |
+| eBay Browse search | active | eBay keys set; the model runs the query |
+| eBay image search | active | eBay keys set and the frame has one item |
+| PriceCharting | sold-based, one price for the item's condition (loose, complete in box, or new) | Token set; games, cards, comics, LEGO, Funko, electronics, or a barcode |
+| Discogs | active (lowest price) | Token set; media or a barcode |
+
+The code then does the math, not the model:
+
+1. Converts every comp to the market currency with the daily ECB rate from Frankfurter. The original price is kept.
+2. Removes duplicates by URL and by title plus price, so a listing the model copied from a tool result counts once.
+3. Scores every comp, including the ones the research model picked, for "same product, comparable condition": with Jev when `TYPESAFE_API_KEY` is set, or with a token match on brand, model, and name. A barcode lookup on PriceCharting or Discogs is exact and scores 0.9; a keyword search on them is scored like any other comp. Comps below 0.6 are shown struck through and are not used.
+4. Computes the median and range for sold, listed, and retail comps, after removing outliers (Tukey fences) and preferring sales from the last 180 days.
+5. Uses the sold median for the online sale price when there are at least 2 sold comps, and the listed median for the active price. Otherwise it keeps the model's figures.
+
+eBay's sold-listing API (Marketplace Insights) is limited to approved partners, so sold evidence comes from PriceCharting and web search.
+
+PriceCharting requests go through one queue at most once a second, as its terms require, and results are cached for 6 hours in each Worker isolate. Barcode identities are cached for 24 hours, because UPCitemdb's free tier allows about 100 lookups a day.
+
+## Barcodes
+
+The browser reads UPC-A, EAN-13, EAN-8, and ISBN barcodes. It uses the native `BarcodeDetector` in Chrome and Android, and the ZXing WebAssembly ponyfill in Safari, iOS, and Firefox. Codes with a bad check digit are ignored. A new barcode always sends a frame, even when the scene has not changed. Barcodes are also read from uploaded photos.
+
+The server looks up each code while Luna identifies the frame: ISBNs with Open Library, and other codes with UPCitemdb (title and brand only; its prices are not reliable). Luna links each code to the item it is on. Research and the PriceCharting and Discogs lookups then use the exact identity.
+
+## Live price labels
+
+When a frame's finds arrive, each find is linked to the on-device detection box that overlaps it in that frame. The first match with a live detection needs an IoU of at least 0.5, because the boxes are seconds old by then. After that, the label follows its object as the camera moves (same COCO label, IoU ≥ 0.3). A label is removed 1.5 seconds after its object leaves the view, and finds that arrive more than 10 seconds after capture get no label. Tap a label, or focus it and press Enter, to open the find.
+
+## Where to sell, and buy or pass
+
+The item detail sheet lists the net for each platform in the item's market, after fees and seller-paid shipping:
+
+| Market | Platforms and fees (checked September 2026, most categories) |
+| --- | --- |
+| US | Local (0%), eBay (13.6% + $0.30 or $0.40), Mercari (10%), Poshmark (fashion and home; $2.95 under $15, else 20%; buyer pays shipping), Facebook shipped (10%, minimum $0.80), Etsy (vintage only; 6.5% + 3% + $0.25 + $0.20) |
+| CA | Local (0%), eBay.ca (13.6% + C$0.30 or C$0.40), Poshmark Canada (fashion and home; C$3.95 under C$20, else 20%), Etsy (vintage only; 6.5% + 3% + 1.15% + C$0.25 + about C$0.28) |
+
+Fee schedules are in `src/markets.ts`. Platforms change their fees, so check them from time to time. A platform where the seller pays shipping is left out of the comparison until a shipping estimate exists. Selling online is recommended only when the best online net beats a local sale by at least $5 or 15%.
+
+The **buy / negotiate / pass** verdict uses the best net. The profit target is a number in the item's own currency: $10 means US$10 for a USD find and C$10 for a CAD find. The maximum offer is the lower of "net minus minimum profit" and "net ÷ (1 + minimum ROI)", rounded down to a whole dollar. A tag up to 35% over the maximum gives "negotiate", because yard-sale sellers often take less. Without a tag, the sheet shows only the maximum offer.
 
 The UI reports cumulative frames processed, items identified, searches performed, underlying model calls, frames skipped on the device, and frames still in research. See [FEATURES.md](./FEATURES.md) for live-feed tracking, natural-language filters, eBay integration, and batch processing.
 
