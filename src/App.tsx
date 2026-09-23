@@ -14,6 +14,7 @@ import {
   ImageUp,
   LoaderCircle,
   ScanLine,
+  Receipt,
   Search,
   Settings,
   Square,
@@ -27,7 +28,8 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { gateFrame, sellableDetections } from "./detection";
 import { detectVideoFrame, loadDetector } from "./detector";
 import { loadBarcodeReader, readBarcodes } from "./barcodes";
-import { MARKETS } from "./markets";
+import { marketForCurrency, MARKETS, PLATFORMS } from "./markets";
+import { defaultFeesCents, EMPTY_LEDGER, ledgerSummary, parseMoneyInput, realizedProfitCents } from "./ledger";
 import { mergeTracks, seedTracks, type Track, TRACK_MAX_SEED_DELAY_MS, updateTracks } from "./tracking";
 import { compStats, MIN_MATCH_SCORE, type PriceStats } from "./comps";
 import { DEFAULT_OFFER_TARGETS, localResaleCents, offerAdvice, type OfferTargets, saleOutlook } from "./pricing";
@@ -72,6 +74,25 @@ const FIND_CRITERIA_PRESETS = [
 ];
 
 type View = "scan" | "history";
+/** Where an opened find returns to when it is closed. */
+type FindOrigin = View | "ledger";
+
+async function fetchLedgerItems(): Promise<DetectedItem[]> {
+  const response = await fetch("/api/ledger");
+  if (!response.ok) throw new Error("Could not load your ledger.");
+  return response.json();
+}
+
+async function saveLedgerRequest(itemId: string, ledger: Record<string, unknown>): Promise<DetectedItem> {
+  const response = await fetch(`/api/items/${encodeURIComponent(itemId)}/ledger`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(ledger),
+  });
+  const body = (await response.json()) as DetectedItem | { error?: string };
+  if (!response.ok) throw new Error("error" in body && body.error ? body.error : "Could not save the ledger.");
+  return body as DetectedItem;
+}
 type Source = "camera" | "video" | "image";
 type DetectorStatus = "off" | "loading" | "ready" | "failed";
 
@@ -245,7 +266,9 @@ export default function App({ children }: { children?: React.ReactNode }) {
   const findPath = location.pathname.split("/");
   const itemId = findPath[1] === "finds" && findPath[2] ? decodeURIComponent(findPath[2]) : null;
   const activityOpen = Boolean(itemId && findPath[3] === "activity");
-  const view: View = location.pathname === "/history" || (itemId && location.search.from !== "scan")
+  const findOrigin: FindOrigin = location.search.from === "scan" ? "scan" : location.search.from === "ledger" ? "ledger" : "history";
+  const ledgerOpen = location.pathname === "/ledger" || (Boolean(itemId) && findOrigin === "ledger");
+  const view: View = location.pathname === "/history" || location.pathname === "/ledger" || (itemId && findOrigin !== "scan")
     ? "history"
     : "scan";
   const { data: stats = EMPTY_STATS } = useQuery({ queryKey: ["stats"], queryFn: fetchStats });
@@ -258,6 +281,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
     [...new Map(savedFinds.data?.pages.flatMap((page) => page.items).map((item) => [item.id, item]) ?? []).values()],
   [savedFinds.data]);
   const searchPending = historySearch.trim() !== debouncedSearch;
+  const ledgerQuery = useQuery({ queryKey: ["ledger"], queryFn: fetchLedgerItems, enabled: ledgerOpen });
+  const ledgerItems = ledgerQuery.data ?? NO_ITEMS;
   const { data: routedFrameItems = NO_ITEMS } = useQuery({
     queryKey: ["frame-items", itemId],
     queryFn: () => fetchFrameItems(itemId!),
@@ -338,7 +363,10 @@ export default function App({ children }: { children?: React.ReactNode }) {
       setSelectedFrameItems([]);
       return;
     }
-    const availableItems = [...routedFrameItems, ...liveItems, ...historyItems];
+    // The same find can be in several lists; keep the first copy of each, so frame lists have unique keys.
+    const availableItems = [
+      ...new Map([...routedFrameItems, ...liveItems, ...historyItems, ...ledgerItems].reverse().map((item) => [item.id, item])).values(),
+    ].reverse();
     const routeItem = availableItems.find((item) => item.id === itemId);
     if (!routeItem) return;
     setSelectedItem(routeItem);
@@ -347,7 +375,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
         ? routedFrameItems
         : availableItems.filter((item) => item.thumbnailUrl === routeItem.thumbnailUrl),
     );
-  }, [historyItems, itemId, liveItems, routedFrameItems]);
+  }, [historyItems, itemId, ledgerItems, liveItems, routedFrameItems]);
 
   const playFoundSound = useCallback(() => {
     const context = getAudioContext();
@@ -830,8 +858,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
     setStillPreviewUrl(null);
   }, [view]);
 
-  const openItem = (selected: DetectedItem, sourceView: View) => {
-    const sourceItems = sourceView === "scan" ? liveItems : historyItems;
+  const openItem = (selected: DetectedItem, sourceView: FindOrigin) => {
+    const sourceItems = sourceView === "scan" ? liveItems : sourceView === "ledger" ? ledgerItems : historyItems;
     setSelectedItem(selected);
     setSelectedFrameItems(sourceItems.filter((candidate) => candidate.thumbnailUrl === selected.thumbnailUrl));
     void navigate({
@@ -840,6 +868,16 @@ export default function App({ children }: { children?: React.ReactNode }) {
       search: { from: sourceView },
       resetScroll: false,
     });
+  };
+
+  const applySavedItem = (saved: DetectedItem) => {
+    const replace = (item: DetectedItem) => (item.id === saved.id ? saved : item);
+    setSelectedItem((current) => (current?.id === saved.id ? saved : current));
+    setSelectedFrameItems((current) => current.map(replace));
+    setLiveItems((current) => current.map(replace));
+    queryClient.setQueriesData<DetectedItem[]>({ queryKey: ["frame-items"] }, (current) => current?.map(replace));
+    void queryClient.invalidateQueries({ queryKey: ["ledger"] });
+    void refreshHistory();
   };
 
   const deleteFind = async (item: DetectedItem) => {
@@ -1028,8 +1066,8 @@ export default function App({ children }: { children?: React.ReactNode }) {
         <main className="history-screen">
           <header className="history-heading">
             <div>
-              <p className="eyebrow">All-time finds</p>
-              <h1>History</h1>
+              <p className="eyebrow">{ledgerOpen ? "What you bought and sold" : "All-time finds"}</p>
+              <h1>{ledgerOpen ? "Ledger" : "History"}</h1>
             </div>
             <div className="history-actions">
               <button className="icon-button" onClick={() => void refreshHistory()} aria-label="Refresh history">
@@ -1040,6 +1078,13 @@ export default function App({ children }: { children?: React.ReactNode }) {
               </button>
             </div>
           </header>
+          <nav className="history-tabs" aria-label="History views">
+            <Link to="/history" className={ledgerOpen ? "" : "active"}>Finds</Link>
+            <Link to="/ledger" className={ledgerOpen ? "active" : ""}>Ledger</Link>
+          </nav>
+          {ledgerOpen ? (
+            <LedgerScreen query={ledgerQuery} onSelect={(selected) => openItem(selected, "ledger")} />
+          ) : (<>
           <section className="stats-ribbon history-stats" aria-label="Processing statistics">
             <Stat label="Frames" value={stats.framesProcessed} />
             <Stat label="Items" value={stats.itemsIdentified} />
@@ -1073,6 +1118,7 @@ export default function App({ children }: { children?: React.ReactNode }) {
             </div>
             <HistoryLoadMore query={history} disabled={searchPending} />
           </section>
+          </>)}
         </main>
       )}
 
@@ -1290,29 +1336,30 @@ export default function App({ children }: { children?: React.ReactNode }) {
                 ? {
                     to: "/finds/$itemId/activity",
                     params: { itemId: nextItem.id },
-                    search: { from: view },
+                    search: { from: findOrigin },
                     replace: true,
                     resetScroll: false,
                   }
                 : {
                     to: "/finds/$itemId",
                     params: { itemId: nextItem.id },
-                    search: { from: view },
+                    search: { from: findOrigin },
                     replace: true,
                     resetScroll: false,
                   },
             );
           }}
           activityOpen={activityOpen}
+          onLedgerSaved={applySavedItem}
           onToggleActivity={() => {
             void navigate(
               activityOpen
-                ? { to: "/finds/$itemId", params: { itemId: selectedItem.id }, search: { from: view }, resetScroll: false }
-                : { to: "/finds/$itemId/activity", params: { itemId: selectedItem.id }, search: { from: view }, resetScroll: false },
+                ? { to: "/finds/$itemId", params: { itemId: selectedItem.id }, search: { from: findOrigin }, resetScroll: false }
+                : { to: "/finds/$itemId/activity", params: { itemId: selectedItem.id }, search: { from: findOrigin }, resetScroll: false },
             );
           }}
           onClose={() => {
-            void navigate({ to: view === "scan" ? "/scan" : "/history", resetScroll: false });
+            void navigate({ to: findOrigin === "ledger" ? "/ledger" : view === "scan" ? "/scan" : "/history", resetScroll: false });
           }}
         />
       )}
@@ -1400,7 +1447,13 @@ function ItemCard({
         </div>
         <div className="card-badges">
           <PricingBadge item={item} />
-          <OfferBadge item={item} />
+          {item.ledger?.saleCents != null ? (
+            <span className="ledger-badge sold">Sold {money(item.ledger.saleCents, item.currency)}</span>
+          ) : item.ledger?.purchaseCents != null ? (
+            <span className="ledger-badge bought">Bought {money(item.ledger.purchaseCents, item.currency)}</span>
+          ) : (
+            <OfferBadge item={item} />
+          )}
           <OnlineBadge item={item} />
           {item.observedPriceCents !== null && <span className="tag-price">Tag {money(item.observedPriceCents, item.currency)}</span>}
         </div>
@@ -1443,6 +1496,7 @@ function ItemDetail({
   item,
   frameItems,
   activityOpen,
+  onLedgerSaved,
   onToggleActivity,
   onSelect,
   onClose,
@@ -1450,6 +1504,7 @@ function ItemDetail({
   item: DetectedItem;
   frameItems: DetectedItem[];
   activityOpen: boolean;
+  onLedgerSaved: (item: DetectedItem) => void;
   onToggleActivity: () => void;
   onSelect: (item: DetectedItem) => void;
   onClose: () => void;
@@ -1557,6 +1612,7 @@ function ItemDetail({
                 <p>{item.valueSummary}</p>
               </div>
               <OfferPanel item={item} />
+              <LedgerPanel key={`${item.id}-${JSON.stringify(item.ledger)}`} item={item} onSaved={onLedgerSaved} />
               <PriceBreakdown item={item} />
               <SaleOptionsPanel item={item} />
               <a
@@ -1967,6 +2023,174 @@ function PriceBreakdown({ item }: { item: DetectedItem }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+function centsToInput(cents: number | null | undefined): string {
+  return cents == null ? "" : (cents / 100).toFixed(cents % 100 === 0 ? 0 : 2);
+}
+
+function LedgerPanel({ item, onSaved }: { item: DetectedItem; onSaved: (item: DetectedItem) => void }) {
+  const ledger = item.ledger;
+  const platforms = PLATFORMS[marketForCurrency(item.currency)];
+  const [purchase, setPurchase] = useState(centsToInput(ledger?.purchaseCents));
+  const [sale, setSale] = useState(centsToInput(ledger?.saleCents));
+  const [platformId, setPlatformId] = useState(ledger?.platformId ?? saleOutlook(item).best?.platform.id ?? "local");
+  const [fees, setFees] = useState(centsToInput(ledger?.feesCents));
+  const [shipping, setShipping] = useState(centsToInput(ledger?.shippingCents));
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const purchaseCents = parseMoneyInput(purchase);
+  const saleCents = parseMoneyInput(sale);
+  const feesCents = parseMoneyInput(fees);
+  const shippingCents = parseMoneyInput(shipping);
+  const invalid = [purchaseCents, saleCents, feesCents, shippingCents].includes("invalid");
+  const suggestedFees = typeof saleCents === "number" ? defaultFeesCents(item.currency, platformId, saleCents) : null;
+  const preview =
+    !invalid && typeof purchaseCents === "number" && typeof saleCents === "number"
+      ? realizedProfitCents({
+          ...EMPTY_LEDGER,
+          purchaseCents,
+          saleCents,
+          feesCents: (feesCents as number | null) ?? suggestedFees,
+          shippingCents: shippingCents as number | null,
+        })
+      : null;
+
+  const save = async () => {
+    if (invalid) {
+      setMessage("Type amounts as numbers, for example 12 or 12.50.");
+      return;
+    }
+    setSaving(true);
+    setMessage(null);
+    try {
+      const saved = await saveLedgerRequest(item.id, {
+        purchaseCents,
+        saleCents,
+        platformId: saleCents === null ? null : platformId,
+        feesCents,
+        shippingCents,
+      });
+      onSaved(saved);
+    } catch (saveError) {
+      setMessage(saveError instanceof Error ? saveError.message : "Could not save the ledger.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="ledger-panel" data-export-exclude>
+      <h3><Receipt size={16} /> My purchase and sale</h3>
+      <div className="ledger-grid">
+        <label>
+          <span>Bought for</span>
+          <input inputMode="decimal" placeholder={item.observedPriceCents === null ? "0" : centsToInput(item.observedPriceCents)} value={purchase} onChange={(event) => setPurchase(event.target.value)} />
+        </label>
+        <label>
+          <span>Sold for</span>
+          <input inputMode="decimal" placeholder="Not sold" value={sale} onChange={(event) => setSale(event.target.value)} />
+        </label>
+        {sale.trim() !== "" && (
+          <>
+            <label className="wide">
+              <span>Sold on</span>
+              <select value={platformId} onChange={(event) => setPlatformId(event.target.value)}>
+                {platforms.map((platform) => <option key={platform.id} value={platform.id}>{platform.name}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>Fees</span>
+              <input inputMode="decimal" placeholder={suggestedFees === null ? "0" : centsToInput(suggestedFees)} value={fees} onChange={(event) => setFees(event.target.value)} />
+            </label>
+            <label>
+              <span>Shipping you paid</span>
+              <input inputMode="decimal" placeholder="0" value={shipping} onChange={(event) => setShipping(event.target.value)} />
+            </label>
+          </>
+        )}
+      </div>
+      <div className="ledger-actions">
+        <button type="button" onClick={() => void save()} disabled={saving}>
+          {saving ? <LoaderCircle className="spin" size={15} /> : null} Save
+        </button>
+        {preview !== null && (
+          <span className={preview >= 0 ? "good" : "bad"}>
+            Profit {preview < 0 ? "−" : ""}{money(Math.abs(preview), item.currency)}
+          </span>
+        )}
+        {ledger?.estimateCents != null && ledger.saleCents != null && (
+          <span>The app expected {money(ledger.estimateCents, item.currency)}.</span>
+        )}
+      </div>
+      <small>Amounts are in {item.currency}. An empty fee uses the platform's standard fee. Clear both prices and save to remove the entry.</small>
+      {message && <p className="ledger-error" role="alert">{message}</p>}
+    </section>
+  );
+}
+
+function LedgerScreen({
+  query,
+  onSelect,
+}: {
+  query: { data?: DetectedItem[]; isPending: boolean; isError: boolean; error: Error | null; refetch: () => unknown };
+  onSelect: (item: DetectedItem) => void;
+}) {
+  const ledgerItems = query.data ?? NO_ITEMS;
+  const { totals, accuracy } = useMemo(() => ledgerSummary(ledgerItems), [ledgerItems]);
+  if (query.isError) {
+    return (
+      <div className="history-status" role="alert">
+        <span>{query.error?.message}</span>
+        <button className="history-load-more" onClick={() => void query.refetch()}>Retry</button>
+      </div>
+    );
+  }
+  if (query.isPending) return <p className="history-status" role="status">Loading ledger…</p>;
+  if (ledgerItems.length === 0) {
+    return (
+      <div className="empty-feed">
+        <Receipt size={36} />
+        <p>Open a find and enter what you paid, and later what it sold for. Your profit and the app's accuracy show here.</p>
+      </div>
+    );
+  }
+  const percent = (value: number) => `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.round(Math.abs(value) * 100)}%`;
+
+  return (
+    <section className="ledger-screen">
+      {totals.map((total) => (
+        <dl className="ledger-totals" key={total.currency}>
+          <div><dt>Profit ({total.currency})</dt><dd className={total.profitCents >= 0 ? "good" : "bad"}>{total.profitCents < 0 ? "−" : ""}{money(Math.abs(total.profitCents), total.currency)}</dd></div>
+          <div><dt>ROI on sold</dt><dd>{total.roi === null ? "—" : `${Math.round(total.roi * 100)}%`}</dd></div>
+          <div><dt>Bought / sold</dt><dd>{total.bought} / {total.sold}</dd></div>
+          <div><dt>Spent</dt><dd>{money(total.spentCents, total.currency)}</dd></div>
+          <div><dt>Revenue</dt><dd>{money(total.revenueCents, total.currency)}</dd></div>
+          <div><dt>Unsold stock</dt><dd>{money(total.inventoryCents, total.currency)}</dd></div>
+        </dl>
+      ))}
+      {accuracy.length > 0 && (
+        <table className="accuracy-table">
+          <caption>How close the app's estimates were</caption>
+          <thead><tr><th>Group</th><th>Sales</th><th>Typical miss</th><th>Bias</th></tr></thead>
+          <tbody>
+            {accuracy.map((entry) => (
+              <tr key={entry.group}>
+                <td>{entry.group}</td>
+                <td>{entry.count}</td>
+                <td>{Math.round(entry.medianAbsErrorPct * 100)}%</td>
+                <td title="Positive: sold for more than the estimate. Negative: the estimate was too high.">{percent(entry.medianErrorPct)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <div className="item-feed">
+        {ledgerItems.map((item) => <ItemCard key={`${item.id}-ledger`} item={item} showCapturedAt onSelect={onSelect} />)}
+      </div>
+    </section>
   );
 }
 

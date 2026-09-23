@@ -43,6 +43,13 @@
       "when": 1790187977629,
       "tag": "0005_comps_and_markets",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790191851089,
+      "tag": "0006_ledger",
+      "breakpoints": true
     }
   ]
 }

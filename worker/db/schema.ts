@@ -37,6 +37,15 @@ export const items = sqliteTable(
     }).notNull().default("other"),
     vintage: integer("vintage", { mode: "boolean" }).notNull().default(false),
     barcode: text("barcode"),
+    // The user's own purchase and sale, in the item's currency.
+    ledgerPurchaseCents: integer("ledger_purchase_cents"),
+    ledgerPurchasedAt: text("ledger_purchased_at"),
+    ledgerSaleCents: integer("ledger_sale_cents"),
+    ledgerSoldAt: text("ledger_sold_at"),
+    ledgerPlatformId: text("ledger_platform_id"),
+    ledgerFeesCents: integer("ledger_fees_cents"),
+    ledgerShippingCents: integer("ledger_shipping_cents"),
+    ledgerEstimateCents: integer("ledger_estimate_cents"),
     valueSummary: text("value_summary").notNull(),
     pricingPath: text("pricing_path", { enum: ["instant", "research"] }).notNull().default("research"),
     pricingStatus: text("pricing_status", { enum: ["priced", "researching", "research_failed"] })

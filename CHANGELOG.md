@@ -2,10 +2,15 @@
 
 All notable changes to Yard Sale Gold. Dates use ISO 8601.
 
-## [Unreleased] — local setup
+## [Unreleased] — local setup and ledger
 
 ### Added
 
+- **Ledger.** Record what you paid for a find and what it sold for, on which platform, with fees (prefilled from the platform) and shipping. The app stores its own estimate with each sale.
+- **History → Ledger** screen: profit, ROI, spending, revenue, unsold stock, and how close the app's estimates were, by pricing path, goods type, and local or online sale.
+- `PUT /api/items/:id/ledger` and `GET /api/ledger`, with input checks.
+- Bought and sold badges on item cards.
+- Migration `0006_ledger`.
 - `wrangler.local.jsonc`, `npm run setup:local`, and `npm run dev:local`: run the app fully on your machine with local D1 and R2. No Cloudflare account or token is needed.
 
 ### Fixed
@@ -13,6 +18,7 @@ All notable changes to Yard Sale Gold. Dates use ISO 8601.
 - The item sheet could start a React render loop ("Maximum update depth exceeded") while its frame query was loading. The default empty list is now one shared array.
 - "Profit at tag" used the local price, but the buy / pass verdict used the best net. Both now use the best net.
 - A platform with no fee shows "—", not "−$0".
+- A find that was in two lists (for example live and history) could appear twice in the item sheet's frame list, with duplicate React keys.
 
 ## Comps and markets — branch `feature/comps-markets`
 
